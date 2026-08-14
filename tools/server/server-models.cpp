@@ -2557,14 +2557,13 @@ void server_models_routes::init_routes() {
                         prefill_id,
                         decode_id);
 
-                // Keep prefills independent and use two CPU decode lanes.
-                // Each lane stays serialized and reuses one persistent
-                // 4-thread Decode Context; two lanes match the 8 CPU cores
-                // without the oversubscription of four concurrent contexts.
-                if (candidate_index > 1) {
+                // Keep NPU prefills independent, but serialize CPU decode.
+                // One persistent 4-thread Decode Context is reused across
+                // all candidates to avoid memory-bandwidth contention.
+                if (candidate_index > 0) {
                     const int previous_decode_id =
                             generation_decode_base_id +
-                            static_cast<int>(candidate_index - 2);
+                            static_cast<int>(candidate_index - 1);
 
                     phase_b.add_dependency(
                             previous_decode_id,

@@ -21,8 +21,32 @@ RagTaskResult RagServerExecutor::execute(const RagTaskContext & ctx) {
         const RagRequest & req = runtime->request;
         if (type_ == RagTaskType::DocumentEmbedding) {
             runtime->chunks = rag_split_document(req.doc);
-            if (runtime->chunks.empty()) throw std::runtime_error("document produced no chunks");
-            runtime->document_embeddings = models_->request_model_embeddings(req.embedding_model, runtime->chunks);
+            if (runtime->chunks.empty()) {
+                throw std::runtime_error("document produced no chunks");
+            }
+
+            // Match PowerServe semantics: embed document chunks one by one.
+            // Batched embedding changes floating-point results enough to alter
+            // retrieval ordering and even the top-k candidate set.
+            runtime->document_embeddings.clear();
+            runtime->document_embeddings.reserve(runtime->chunks.size());
+
+            for (const auto & chunk : runtime->chunks) {
+                auto embeddings =
+                        models_->request_model_embeddings(
+                                req.embedding_model,
+                                {chunk});
+
+                if (embeddings.size() != 1 ||
+                    embeddings.front().empty()) {
+                    throw std::runtime_error(
+                            "DocumentEmbedding expected exactly one "
+                            "non-empty embedding per chunk");
+                }
+
+                runtime->document_embeddings.push_back(
+                        std::move(embeddings.front()));
+            }
         } else if (type_ == RagTaskType::QueryExpansion) {
             runtime->expanded_queries.clear();
             runtime->query_expansion_used = false;
@@ -49,8 +73,26 @@ RagTaskResult RagServerExecutor::execute(const RagTaskContext & ctx) {
                                                 req.max_tokens,
                                                 96),
                                     },
-                                    {"temperature", 0.2F},
+                                    {"temperature", req.temperature},
+                                    {"top_k", 40},
+                                    {"top_p", 0.95F},
+                                      {"min_p", 0.0F},
+                                      {"repeat_last_n", 64},
+                                      {"repeat_penalty", 1.0F},
+                                      {"presence_penalty", 0.0F},
+                                      {"frequency_penalty", 0.0F},
+                                      {
+                                          "samplers",
+                                          json::array({
+                                              "penalties",
+                                              "top_k",
+                                              "temperature",
+                                              "top_p",
+                                          }),
+                                      },
+                                    {"seed", req.seed},
                                     {"stream", false},
+                                    {"cache_prompt", false},
                                 });
 
                 if (!response.contains("content") ||
@@ -212,15 +254,37 @@ RagTaskResult RagServerExecutor::execute(const RagTaskContext & ctx) {
                             runtime->retrieval_results,
                             req.top_k);
         } else if (type_ == RagTaskType::Reranking) {
-            std::vector<std::string> candidates;
-            for (auto index : runtime->retrieved_indices) if (index < runtime->chunks.size()) candidates.push_back(runtime->chunks[index]);
-            runtime->reranked_chunks = candidates;
-            if (!req.rerank_model.empty()) {
-                const json ranked = models_->request_model_rerank(req.rerank_model, req.query, candidates, req.top_n);
-                runtime->reranked_chunks.clear();
-                for (const auto & item : ranked) { const auto i = item["index"].get<std::size_t>(); if (i < candidates.size()) runtime->reranked_chunks.push_back(candidates[i]); }
+        std::vector<std::string> candidates;
+
+        for (const auto index : runtime->retrieved_indices) {
+            if (index < runtime->chunks.size()) {
+                candidates.push_back(runtime->chunks[index]);
             }
-        } else if (
+        }
+
+        runtime->reranked_chunks = candidates;
+
+        if (!req.rerank_model.empty()) {
+            const json ranked =
+                    models_->request_model_rerank(
+                            req.rerank_model,
+                            req.query,
+                            candidates,
+                            req.top_n);
+
+            runtime->reranked_chunks.clear();
+
+            for (const auto & item : ranked) {
+                const auto i =
+                        item["index"].get<std::size_t>();
+
+                if (i < candidates.size()) {
+                    runtime->reranked_chunks.push_back(
+                            candidates[i]);
+                }
+            }
+        }
+    } else if (
                 type_ == RagTaskType::GenerationPrefill) {
             if (ctx.candidate_index == RAG_INVALID_INDEX ||
                 ctx.candidate_index >=
@@ -262,10 +326,26 @@ RagTaskResult RagServerExecutor::execute(const RagTaskContext & ctx) {
                     static_cast<std::uint32_t>(
                             ctx.candidate_index);
 
-            candidate.prompt =
-                    build_generation_prompt(
+            std::vector<std::string> prompt_sub_queries;
+
+            if (!uses_sub_query &&
+                runtime->query_expansion_used) {
+                prompt_sub_queries =
+                        runtime->expanded_queries;
+            }
+
+            candidate.prompt.clear();
+
+            const auto generation_segments =
+                    build_generation_segments(
                             prompt_query,
+                            prompt_sub_queries,
                             runtime->reranked_chunks);
+
+            for (const auto & segment :
+                 generation_segments) {
+                candidate.prompt += segment;
+            }
 
             candidate.content.clear();
             candidate.stop_reason.clear();
@@ -299,14 +379,24 @@ RagTaskResult RagServerExecutor::execute(const RagTaskContext & ctx) {
                                         req.max_tokens,
                                     },
                                     {"n_cmpl", 1},
-                                    {
-                                        "temperature",
-                                        req.temperature,
-                                    },
-                                    {
-                                        "seed",
-                                        candidate.seed,
-                                    },
+                                    {"temperature", req.temperature},
+                                      {"top_k", 40},
+                                      {"top_p", 0.95F},
+                                      {"min_p", 0.0F},
+                                      {"repeat_last_n", 64},
+                                      {"repeat_penalty", 1.0F},
+                                      {"presence_penalty", 0.0F},
+                                      {"frequency_penalty", 0.0F},
+                                      {
+                                          "samplers",
+                                          json::array({
+                                              "penalties",
+                                              "top_k",
+                                              "temperature",
+                                              "top_p",
+                                          }),
+                                      },
+                                      {"seed", req.seed},
                                     {"stream", false},
                                     {"cache_prompt", false},
                                     {
@@ -464,14 +554,24 @@ RagTaskResult RagServerExecutor::execute(const RagTaskContext & ctx) {
                                             req.max_tokens,
                                         },
                                         {"n_cmpl", 1},
-                                        {
-                                            "temperature",
-                                            req.temperature,
-                                        },
-                                        {
-                                            "seed",
-                                            candidate.seed,
-                                        },
+                                        {"temperature", req.temperature},
+                                      {"top_k", 40},
+                                      {"top_p", 0.95F},
+                                      {"min_p", 0.0F},
+                                      {"repeat_last_n", 64},
+                                      {"repeat_penalty", 1.0F},
+                                      {"presence_penalty", 0.0F},
+                                      {"frequency_penalty", 0.0F},
+                                      {
+                                          "samplers",
+                                          json::array({
+                                              "penalties",
+                                              "top_k",
+                                              "temperature",
+                                              "top_p",
+                                          }),
+                                      },
+                                      {"seed", req.seed},
                                         {"stream", false},
                                         {"cache_prompt", false},
                                         {
@@ -488,14 +588,12 @@ RagTaskResult RagServerExecutor::execute(const RagTaskContext & ctx) {
                                             req
                                                     .generation_decode_backend,
                                         },
-                                        // Two serialized decode lanes reuse
-                                        // slots 0 and 1 respectively. This
-                                        // keeps one persistent CPU Context per
-                                        // lane while using all eight CPU cores
-                                        // across the two 4-thread candidates.
+                                        // Reuse one persistent CPU Decode Context for all
+                                        // generation candidates. Two concurrent 4-thread
+                                        // decode lanes were measured to halve per-lane
+                                        // throughput without improving aggregate throughput.
                                         {"id_slot",
-                                         static_cast<int>(
-                                                 ctx.candidate_index % 2)},
+                                         0},
                                         {
                                             "backend_sampling",
                                             false,
@@ -620,10 +718,26 @@ RagTaskResult RagServerExecutor::execute(const RagTaskContext & ctx) {
                     static_cast<std::uint32_t>(
                             ctx.candidate_index);
 
-            candidate.prompt =
-                    build_generation_prompt(
+            std::vector<std::string> prompt_sub_queries;
+
+            if (!uses_sub_query &&
+                runtime->query_expansion_used) {
+                prompt_sub_queries =
+                        runtime->expanded_queries;
+            }
+
+            candidate.prompt.clear();
+
+            const auto generation_segments =
+                    build_generation_segments(
                             prompt_query,
+                            prompt_sub_queries,
                             runtime->reranked_chunks);
+
+            for (const auto & segment :
+                 generation_segments) {
+                candidate.prompt += segment;
+            }
 
             candidate.content.clear();
             candidate.stop_reason.clear();
@@ -649,15 +763,26 @@ RagTaskResult RagServerExecutor::execute(const RagTaskContext & ctx) {
                                         "n_predict",
                                         req.max_tokens,
                                     },
-                                    {
-                                        "temperature",
-                                        req.temperature,
-                                    },
-                                    {
-                                        "seed",
-                                        candidate.seed,
-                                    },
+                                    {"temperature", req.temperature},
+                                      {"top_k", 40},
+                                      {"top_p", 0.95F},
+                                      {"min_p", 0.0F},
+                                      {"repeat_last_n", 64},
+                                      {"repeat_penalty", 1.0F},
+                                      {"presence_penalty", 0.0F},
+                                      {"frequency_penalty", 0.0F},
+                                      {
+                                          "samplers",
+                                          json::array({
+                                              "penalties",
+                                              "top_k",
+                                              "temperature",
+                                              "top_p",
+                                          }),
+                                      },
+                                      {"seed", req.seed},
                                     {"stream", false},
+                                {"cache_prompt", false},
                                     {
                                         "generation_handoff",
                                         req.generation_prefill_backend !=

@@ -5776,6 +5776,9 @@ void server_routes::init_routes() {
             for (size_t i = 0; i < documents.size(); i++) {
                 auto tmp = format_prompt_rerank(ctx_server.model_tgt, ctx_server.vocab, ctx_server.mctx, query, documents[i]);
                 server_task task = server_task(SERVER_TASK_TYPE_RERANK);
+                // PowerServe reranking resets KV state for every document.
+                // Disable llama-server slot prompt/KV reuse for workload equivalence.
+                task.params.cache_prompt = false;
                 task.id     = rd.get_new_id();
                 task.tokens = std::move(tmp);
                 tasks.push_back(std::move(task));
@@ -6058,6 +6061,10 @@ std::unique_ptr<server_res_generator> server_routes::handle_embeddings_impl(cons
         for (size_t i = 0; i < tokenized_prompts.size(); i++) {
             server_task task = server_task(SERVER_TASK_TYPE_EMBEDDING);
 
+            // Keep embedding evaluation independent across requests/chunks.
+            // This matches the PowerServe-equivalence baseline and avoids
+            // llama-server slot prompt/KV reuse affecting measurements.
+            task.params.cache_prompt = false;
             task.id     = rd.get_new_id();
             task.tokens = std::move(tokenized_prompts[i]);
 
