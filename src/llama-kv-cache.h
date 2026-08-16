@@ -163,6 +163,13 @@ public:
 
     std::vector<uint32_t> get_layer_ids() const;
     ggml_tensor * get_k_storage(int32_t il) const;
+    ggml_tensor * get_v_storage(int32_t il) const;
+
+    bool is_v_trans() const { return v_trans; }
+
+    uint32_t get_n_embd_head_k(int32_t il) const { return hparams.n_embd_head_k(il); }
+    uint32_t get_n_embd_head_v(int32_t il) const { return hparams.n_embd_head_v(il); }
+    uint32_t get_n_head_kv(int32_t il)     const { return hparams.n_head_kv(il); }
 
     //
     // graph_build API
@@ -211,7 +218,7 @@ public:
 
     void set_input_k_shift(ggml_tensor * dst) const;
 
-    void set_input_kq_mask   (ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const;
+    virtual void set_input_kq_mask   (ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const;
     void set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const;
 
     void set_input_k_rot(ggml_tensor * dst) const;
@@ -235,8 +242,8 @@ private:
 
     bool v_trans = true;  // the value tensor is transposed
 
-    const uint32_t n_seq_max = 1;
-    const uint32_t n_stream  = 1;
+    // n_seq_max moved to protected
+    // n_stream moved to protected
 
     // required padding
     const uint32_t n_pad = 1;
@@ -274,18 +281,22 @@ private:
 
     std::shared_ptr<llama_kv_cells_vec> v_cells_impl;
 
-    llama_kv_cells_vec & v_cells;
-
     // maps from a sequence id to a stream id
     std::vector<uint32_t> seq_to_stream;
 
     // pending stream copies that will be applied during the next update
     stream_copy_info sc_info;
 
+protected:
     std::vector<kv_layer> layers;
 
     // model layer id -> KV cache layer id
     std::unordered_map<int32_t, int32_t> map_layer_ids;
+
+    llama_kv_cells_vec & v_cells;
+
+    const uint32_t n_stream  = 1;
+    const uint32_t n_seq_max = 1;
 
     size_t total_size() const;
 
@@ -362,14 +373,14 @@ public:
     // llama_kv_cache_context specific API
     //
 
-    uint32_t get_n_kv() const;
+    virtual uint32_t get_n_kv() const;
 
     ggml_type type_k() const;
     ggml_type type_v() const;
 
     // get views of the current state of the cache
-    ggml_tensor * get_k(ggml_context * ctx, int32_t il) const;
-    ggml_tensor * get_v(ggml_context * ctx, int32_t il) const;
+    virtual ggml_tensor * get_k(ggml_context * ctx, int32_t il) const;
+    virtual ggml_tensor * get_v(ggml_context * ctx, int32_t il) const;
 
     // store k_cur and v_cur in the cache based on the provided head location
     // note: the heads in k_cur and v_cur should be laid out contiguously in memory
@@ -389,17 +400,23 @@ public:
     ggml_tensor * build_input_k_rot(ggml_context * ctx) const;
     ggml_tensor * build_input_v_rot(ggml_context * ctx) const;
 
-    void set_input_k_idxs(ggml_tensor * dst, const llama_ubatch * ubatch) const;
-    void set_input_v_idxs(ggml_tensor * dst, const llama_ubatch * ubatch) const;
+    virtual void set_input_k_idxs(ggml_tensor * dst, const llama_ubatch * ubatch) const;
+    virtual void set_input_v_idxs(ggml_tensor * dst, const llama_ubatch * ubatch) const;
+
+    // Sparse attention support (no-op in base class, overridden by cluster context)
+    virtual bool use_sparse_attn() const { return false; }
+    virtual ggml_tensor * build_input_k_idxs_sparse(ggml_context *, const llama_ubatch &) const { return nullptr; }
+    virtual ggml_tensor * build_input_v_idxs_sparse(ggml_context *, const llama_ubatch &) const { return nullptr; }
+    virtual uint32_t get_n_kv_sparse() const { return get_n_kv(); }
 
     void set_input_k_shift   (ggml_tensor * dst) const;
-    void set_input_kq_mask   (ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const;
+    virtual void set_input_kq_mask   (ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const;
     void set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const;
 
     void set_input_k_rot(ggml_tensor * dst) const;
     void set_input_v_rot(ggml_tensor * dst) const;
 
-private:
+protected:
     llama_memory_status status;
 
     llama_kv_cache * kv;

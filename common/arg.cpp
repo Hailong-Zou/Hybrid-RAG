@@ -2169,6 +2169,69 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_GRP_ATTN_W").set_examples({LLAMA_EXAMPLE_COMPLETION}));
     add_opt(common_arg(
+        {"--cluster-attn"}, {"--no-cluster-attn"},
+        string_format("enable cluster-based sparse attention (default: %s)", params.cluster_attn ? "enabled" : "disabled"),
+        [](common_params & params, bool value) {
+            params.cluster_attn = value;
+        }
+    ).set_env("LLAMA_ARG_CLUSTER_ATTN"));
+    add_opt(common_arg(
+        {"--cluster-k"}, "N",
+        string_format("Top-K clusters to attend (default: %d)", params.cluster_k),
+        [](common_params & params, int value) {
+            params.cluster_k = value;
+        }
+    ).set_env("LLAMA_ARG_CLUSTER_K"));
+    add_opt(common_arg(
+        {"--cluster-var-threshold"}, "F",
+        string_format("variance threshold for cluster split (default: %.2f)", params.cluster_var_threshold),
+        [](common_params & params, const std::string & value) {
+            params.cluster_var_threshold = std::stof(value);
+        }
+    ).set_env("LLAMA_ARG_CLUSTER_VAR_THRESHOLD"));
+    add_opt(common_arg(
+        {"--max-resident-clusters"}, "N",
+        string_format("maximum resident clusters in memory (default: %d)", params.max_resident_clusters),
+        [](common_params & params, int value) {
+            params.max_resident_clusters = value;
+        }
+    ).set_env("LLAMA_ARG_MAX_RESIDENT_CLUSTERS"));
+    add_opt(common_arg(
+        {"--cluster-update-interval"}, "N",
+        string_format("steps between cluster updates (default: %d)", params.cluster_update_interval),
+        [](common_params & params, int value) {
+            params.cluster_update_interval = value;
+        }
+    ).set_env("LLAMA_ARG_CLUSTER_UPDATE_INTERVAL"));
+    add_opt(common_arg(
+        {"--cluster-topk-tokens"}, "N",
+        string_format("max tokens for score-based sparse attention, 0=all (default: %d)", params.cluster_topk_tokens),
+        [](common_params & params, int value) {
+            params.cluster_topk_tokens = value;
+        }
+    ).set_env("LLAMA_ARG_CLUSTER_TOPK_TOKENS"));
+    add_opt(common_arg(
+        {"--cluster-max-prefetch"}, "N",
+        string_format("max clusters to prefetch ahead (default: %d)", params.cluster_max_prefetch),
+        [](common_params & params, int value) {
+            params.cluster_max_prefetch = value;
+        }
+    ).set_env("LLAMA_ARG_CLUSTER_MAX_PREFETCH"));
+    add_opt(common_arg(
+        {"--cluster-score-select"}, {"--no-cluster-score-select"},
+        string_format("use score-based token selection (default: %s)", params.cluster_score_select ? "enabled" : "disabled"),
+        [](common_params & params, bool value) {
+            params.cluster_score_select = value;
+        }
+    ).set_env("LLAMA_ARG_CLUSTER_SCORE_SELECT"));
+    add_opt(common_arg(
+        {"--layer-chunks"}, "N",
+        string_format("split forward pass into N weight-loading chunks, 0=disabled (default: %d)", params.layer_chunks),
+        [](common_params & params, int value) {
+            params.layer_chunks = value;
+        }
+    ).set_env("LLAMA_ARG_LAYER_CHUNKS"));
+    add_opt(common_arg(
         {"-kvo", "--kv-offload"},
         {"-nkvo", "--no-kv-offload"},
         string_format("whether to enable KV cache offloading (default: %s)", params.no_kv_offload ? "disabled" : "enabled"),

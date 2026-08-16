@@ -1,5 +1,6 @@
 #include "server-generation-executor.h"
 
+#include <cstdio>
 #include <stdexcept>
 
 namespace {
@@ -69,6 +70,17 @@ llama_token server_generation_decode_executor::begin(
                 ctx_.get(),
                 sequence_id_,
                 handoff);
+
+        fprintf(stderr,
+                "HANDOFF_NATIVE_RESTORE_DONE: context=%p seq=%d state_bytes=%zu next_position=%d\n",
+                (void *) ctx_.get(), (int) sequence_id_,
+                handoff.sequence_state.size(), (int) handoff.next_position);
+
+        if (!llama_kv_cache_cluster_rebuild_after_restore(
+                    ctx_.get(), sequence_id_)) {
+            throw std::runtime_error(
+                    "failed to rebuild cluster state after handoff restore");
+        }
 
         common_params_sampling sampling_params =
                 handoff.sampling_params;

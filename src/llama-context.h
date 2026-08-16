@@ -39,6 +39,8 @@ struct llama_memory_buffer {
 
 using llama_memory_buffers = std::map<ggml_backend_buffer_type_t, llama_memory_buffer>;
 
+struct llama_layer_chunk_offload;
+
 struct llama_context {
     // init scheduler and compute buffers, reserve worst-case graphs
     llama_context(
@@ -266,6 +268,11 @@ private:
     // that differs from the layer it belongs to (usually due to missing backend support)
     void resolve_fused_ops(const llama_memory_context_i * mctx, uint32_t n_seqs);
 
+    // per-chunk weight offload via the scheduler eval callback:
+    // the graph is computed in layer-chunk groups and each finished chunk's weights
+    // are madvise(PAGEOUT)'d as soon as its nodes complete (see llama-context.cpp)
+    void setup_layer_chunk_offload();
+
     // TODO: read/write lora adapters and cvec
     size_t state_write_data(llama_io_write_i & io);
     size_t state_read_data (llama_io_read_i  & io);
@@ -366,6 +373,8 @@ private:
 
     llm_graph_result_ptr gf_res_prev;
     llm_graph_result_ptr gf_res_reserve;
+
+    std::unique_ptr<llama_layer_chunk_offload> lc_offload;
 
     // host buffer for the model output (logits and embeddings)
     ggml_backend_buffer_ptr buf_output;

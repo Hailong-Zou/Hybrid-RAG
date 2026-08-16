@@ -1583,6 +1583,9 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     mparams.progress_callback           = params.load_progress_callback;
     mparams.progress_callback_user_data = params.load_progress_callback_user_data;
     mparams.no_alloc                    = params.no_alloc;
+    // with layer-chunks, weights stream from flash per chunk; eager mmap prefetch at
+    // load would defeat the memory saving, so skip it when chunking is enabled
+    mparams.no_mmap_prefetch            = params.layer_chunks > 0;
 
     return mparams;
 }
@@ -1618,6 +1621,16 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.op_offload        = !params.no_op_offload;
     cparams.swa_full          = params.swa_full;
     cparams.kv_unified        = params.kv_unified;
+
+    cparams.cluster_attn           = params.cluster_attn;
+    cparams.cluster_k              = params.cluster_k;
+    cparams.cluster_var_threshold   = params.cluster_var_threshold;
+    cparams.max_resident_clusters   = params.max_resident_clusters;
+    cparams.cluster_update_interval = params.cluster_update_interval;
+    cparams.cluster_topk_tokens     = params.cluster_topk_tokens;
+    cparams.cluster_max_prefetch    = params.cluster_max_prefetch;
+    cparams.cluster_score_select    = params.cluster_score_select;
+    cparams.layer_chunks            = params.layer_chunks;
 
     cparams.type_k = params.cache_type_k;
     cparams.type_v = params.cache_type_v;

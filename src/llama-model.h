@@ -7,6 +7,7 @@
 #include "llama-memory.h"
 #include "llama-vocab.h"
 
+#include <atomic>
 #include <map>
 #include <memory>
 #include <string>
@@ -662,6 +663,22 @@ struct llama_model {
     bool has_tensor_overrides() const;
 
     const struct ggml_tensor * get_tensor(const char * name) const;
+
+    bool supports_mmap_weight_offload() const;
+    // Layer-by-layer weight offloading via madvise:
+    // advice = MADV_DONTNEED (release physical pages), MADV_WILLNEED (preload), MADV_SEQUENTIAL
+    void madvise_all_weights(int advice) const;
+    void madvise_layer_weights(int il_start, int il_end, int advice) const;
+
+    // Aggregated process-lifetime observability. Indexes are WILLNEED,
+    // PAGEOUT, COLD, and other advice respectively.
+    mutable std::atomic<uint64_t> madvise_calls[4] {};
+    mutable std::atomic<uint64_t> madvise_bytes[4] {};
+    mutable std::atomic<uint64_t> madvise_failures[4] {};
+    mutable std::atomic<int>      madvise_last_errno[4] {};
+    mutable std::atomic<uint64_t> madvise_skipped_empty {0};
+    mutable std::atomic<uint64_t> madvise_skipped_non_host {0};
+    mutable std::atomic<uint64_t> madvise_skipped_non_mmap {0};
 
     float get_rope_freq_base (const llama_cparams & cparams, int il) const;
     float get_rope_freq_scale(const llama_cparams & cparams, int il) const;

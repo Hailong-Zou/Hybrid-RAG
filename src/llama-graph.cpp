@@ -1327,6 +1327,8 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     ubatch           (params.ubatch),
     n_embd           (hparams.n_embd),
     n_layer          (hparams.n_layer()),
+    il_start_        (params.il_start),
+    il_end_          (params.il_end),
     n_layer_nextn    (hparams.n_layer_nextn),
     n_rot            (hparams.n_rot()),
     n_ctx            (cparams.n_ctx),
@@ -2610,6 +2612,7 @@ static std::unique_ptr<llm_graph_input_attn_kv> build_attn_inp_kv_impl(
 
         inp->self_kq_mask = build_attn_inp_kq_mask(ctx0, mctx_cur, ubatch, cparams);
         inp->self_kq_mask_cnv = inp->self_kq_mask;
+
     }
 
     inp->self_k_rot = mctx_cur->build_input_k_rot(ctx0);
@@ -2674,6 +2677,64 @@ ggml_tensor * llm_graph_context::build_attn(
     ggml_tensor * k = mctx_cur->get_k(ctx0, il);
     ggml_tensor * v = mctx_cur->get_v(ctx0, il);
 
+    if (mctx_cur->use_sparse_attn()) {
+        // The sparse K/V inputs were pre-copied from the cache during the
+        // set_input phase. At that point the current decode token has not yet
+        // executed cpy_k/cpy_v, so it is absent from those sparse tensors.
+        //
+        // Append k_cur/v_cur directly to the attention inputs. A true
+        // multi-sequence decode ubatch contains one current token per active
+        // sequence, so preserve the complete token dimension here.
+        GGML_ASSERT(k_cur->ne[2] == v_cur->ne[2]);
+        const int64_t n_cur = k_cur->ne[2];
+        GGML_ASSERT(n_cur == (int64_t) ubatch.n_tokens);
+
+        ggml_tensor * k_now = ggml_reshape_4d(
+                ctx0,
+                k_cur,
+                k_cur->ne[0],
+                k_cur->ne[1],
+                n_cur,
+                1);
+
+        if (k_now->type != k->type) {
+            k_now = ggml_cast(ctx0, k_now, k->type);
+        }
+
+        // K layout: [head_dim, n_head_kv, n_kv, stream]
+        k = ggml_concat(ctx0, k, k_now, 2);
+
+        const bool v_trans = v->nb[1] > v->nb[2];
+
+        ggml_tensor * v_now = ggml_reshape_4d(
+                ctx0,
+                v_cur,
+                v_cur->ne[0],
+                v_cur->ne[1],
+                n_cur,
+                1);
+
+        if (!v_trans) {
+            // V layout: [head_dim, n_head_kv, n_kv, stream]
+            if (v_now->type != v->type) {
+                v_now = ggml_cast(ctx0, v_now, v->type);
+            }
+
+            v = ggml_concat(ctx0, v, v_now, 2);
+        } else {
+            // Transposed V layout:
+            // [n_kv, n_head_kv, head_dim, stream]
+            v_now = ggml_permute(ctx0, v_now, 2, 1, 0, 3);
+            v_now = ggml_cont(ctx0, v_now);
+
+            if (v_now->type != v->type) {
+                v_now = ggml_cast(ctx0, v_now, v->type);
+            }
+
+            v = ggml_concat(ctx0, v, v_now, 0);
+        }
+    }
+
     ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, kq_scale, il);
     cb(cur, "kqv_out", il);
 
@@ -2717,6 +2778,7 @@ static std::unique_ptr<llm_graph_input_attn_k> build_attn_inp_k_impl(
 
         inp->self_kq_mask = build_attn_inp_kq_mask(ctx0, mctx_cur, ubatch, cparams);
         inp->self_kq_mask_cnv = inp->self_kq_mask;
+
     }
 
     return inp;

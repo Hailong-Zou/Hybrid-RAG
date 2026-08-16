@@ -328,6 +328,7 @@ extern "C" {
         bool use_extra_bufts; // use extra buffer types (used for weight repacking)
         bool no_host;         // bypass host buffer allowing extra buffers to be used
         bool no_alloc;        // only load metadata and simulate memory allocations
+        bool no_mmap_prefetch;// skip eager mmap prefetch (MAP_POPULATE+WILLNEED) at load
     };
 
     struct llama_sampler_seq_config {
@@ -386,6 +387,19 @@ extern "C" {
         bool kv_unified;  // use a unified buffer across the input sequences when computing the attention
                           // try to disable when n_seq_max > 1 for improved performance when the sequences do not share a large prefix
                           // ref: https://github.com/ggml-org/llama.cpp/pull/14363
+
+        // cluster-based KV cache attention + offloading [EXPERIMENTAL]
+        bool  cluster_attn;            // enable cluster-based sparse attention
+        int   cluster_k;               // Top-K clusters to attend
+        float cluster_var_threshold;    // variance threshold for cluster split
+        int   max_resident_clusters;   // max clusters kept in memory
+        int   cluster_update_interval; // steps between cluster updates (default 1)
+        int   cluster_topk_tokens;     // max tokens for score-based sparse attn (0=all)
+        int   cluster_max_prefetch;    // max clusters to prefetch ahead
+        bool  cluster_score_select;    // use score-based token selection
+
+        // layer-by-layer weight offloading
+        int   layer_chunks;           // 0=disabled, N=chunks (must divide n_layer)
 
         // [EXPERIMENTAL]
         // backend sampler chain configuration (make sure the caller keeps the sampler chains alive)
@@ -919,6 +933,14 @@ extern "C" {
                           size_t   size,
                     llama_seq_id   dest_seq_id,
            llama_state_seq_flags   flags);
+
+    // Rebuild derived cluster-attention metadata from the native KV state
+    // after a sequence-state restore. This is a no-op when cluster attention
+    // is disabled. It must run after llama_state_seq_set_data_ext() and before
+    // the first decode graph is built for the restored sequence.
+    LLAMA_API bool llama_kv_cache_cluster_rebuild_after_restore(
+            struct llama_context * ctx,
+                    llama_seq_id   dest_seq_id);
 
     //
     // Decoding

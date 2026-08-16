@@ -2,22 +2,110 @@
 
 #include "ggml.h"
 #include "llama-arch.h"
+
+#include <sys/mman.h>
+#include <unistd.h>
+#include <atomic>
+#include <future>
 #include "llama-graph.h"
 #include "llama-impl.h"
 #include "llama-batch.h"
 #include "llama-io.h"
 #include "llama-memory.h"
 #include "llama-mmap.h"
+#include "llama-kv-cache-cluster.h"
 #include "llama-model.h"
 #include "llama-ext.h"
 #include "llama.h"
 
 #include <cinttypes>
+#include <cstdio>
 #include <cmath>
 #include <cstring>
 #include <limits>
 #include <stdexcept>
 #include <string>
+
+// Per-chunk weight offload: when --layer-chunks N is active, the scheduler's eval
+// callback makes the graph compute in N layer-chunks. As soon as a chunk's nodes
+// finish, its weights are madvise(PAGEOUT)'d and the next chunk is prefetched,
+// so only ~1/N of the model weights are resident at any time.
+struct llama_layer_chunk_offload {
+    const llama_model * model = nullptr;
+    int layers_per_chunk = 0;
+    // boundaries[c] = first graph node of chunk c (c in [1, N)); [0] unused
+    std::vector<ggml_tensor *> boundaries;
+    // how many chunks ahead to prefetch during the current chunk's compute;
+    // overlaps the next chunk's flash read with this chunk's matmuls
+    int prefetch_depth = 1;
+    // eviction advice for finished chunks: MADV_PAGEOUT (frees memory, re-reads
+    // from flash) or MADV_COLD (stays resident but reclaimable -> faster gen)
+    int evict_advice = MADV_PAGEOUT;
+    ggml_backend_sched_eval_callback user_cb = nullptr;
+    void * user_cb_ud = nullptr;
+    uint64_t setup_count = 0;
+    uint64_t active_setup_count = 0;
+    uint64_t switch_count = 0;
+    uint64_t prefetch_count = 0;
+    int last_boundaries_found = 0;
+    int last_boundaries_expected = 0;
+};
+
+// LLAMA_LAYER_CHUNKS_ADVICE=cold -> MADV_COLD (keep weights resident, faster gen),
+// otherwise MADV_PAGEOUT (evict to flash, lower peak)
+static int llama_layer_chunk_evict_advice() {
+    const char * a = getenv("LLAMA_LAYER_CHUNKS_ADVICE");
+    if (a && strcmp(a, "cold") == 0) {
+        return MADV_COLD;
+    }
+    return MADV_PAGEOUT;
+}
+
+static bool llama_eval_cb_layer_chunk_offload(ggml_tensor * t, bool ask, void * user_data) {
+    auto * d = static_cast<llama_layer_chunk_offload *>(user_data);
+
+    if (ask) {
+        // force a compute-group boundary at the first node of each chunk (c >= 1)
+        for (size_t c = 1; c < d->boundaries.size(); ++c) {
+            if (d->boundaries[c] == t) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // !ask: the boundary node of chunk c was just computed; chunk (c-1) is fully done
+    int c = -1;
+    for (size_t i = 1; i < d->boundaries.size(); ++i) {
+        if (d->boundaries[i] == t) {
+            c = (int) i;
+            break;
+        }
+    }
+    if (c >= 1 && d->model && d->layers_per_chunk > 0) {
+        const int lpc = d->layers_per_chunk;
+        const int n_chunks = (int) d->boundaries.size();
+        d->switch_count++;
+        // evict the chunk that just finished
+        d->model->madvise_layer_weights((c-1)*lpc, c*lpc, d->evict_advice);
+        // current chunk (needed immediately)
+        d->model->madvise_layer_weights(c*lpc, (c+1)*lpc, MADV_WILLNEED);
+        // prefetch next chunk(s) DURING this chunk's compute so the flash read
+        // overlaps with the matmuls (async kernel readahead)
+        for (int k = 1; k <= d->prefetch_depth; ++k) {
+            const int nc = c + k;
+            if (nc < n_chunks) {
+                d->prefetch_count++;
+                d->model->madvise_layer_weights(nc*lpc, (nc+1)*lpc, MADV_WILLNEED);
+            }
+        }
+    }
+
+    if (d->user_cb) {
+        return d->user_cb(t, false, d->user_cb_ud);
+    }
+    return true;
+}
 
 //
 // llama_context
@@ -245,6 +333,24 @@ llama_context::llama_context(
     cparams.op_offload = params.op_offload;
     cparams.kv_unified = params.kv_unified;
 
+    cparams.cluster_attn           = params.cluster_attn;
+    cparams.cluster_k              = params.cluster_k;
+    cparams.cluster_var_threshold   = params.cluster_var_threshold;
+    cparams.max_resident_clusters   = params.max_resident_clusters;
+    cparams.cluster_update_interval = params.cluster_update_interval;
+    cparams.cluster_topk_tokens     = params.cluster_topk_tokens;
+    cparams.cluster_max_prefetch    = params.cluster_max_prefetch;
+    cparams.cluster_score_select    = params.cluster_score_select;
+    cparams.layer_chunks            = params.layer_chunks;
+
+    if (cparams.layer_chunks > 0) {
+        fprintf(stderr,
+                "LAYER_CONTEXT_CONFIG: context=%p chunks=%d mmap_weights=%d "
+                "cluster_attn=%d n_ctx=%u n_seq_max=%u\n",
+                (void *) this, cparams.layer_chunks,
+                (int) model.supports_mmap_weight_offload(),
+                (int) cparams.cluster_attn, cparams.n_ctx, cparams.n_seq_max);
+    }
     // initialized later
     cparams.pipeline_parallel = false;
 
@@ -451,6 +557,26 @@ llama_context::llama_context(
 }
 
 llama_context::~llama_context() {
+    if (cparams.layer_chunks > 0) {
+        const auto * d = lc_offload.get();
+        fprintf(stderr,
+                "LAYER_CHUNK_SUMMARY: context=%p active=%d chunks=%d layers=%d "
+                "setup_count=%llu active_setup_count=%llu switch_count=%llu prefetch_count=%llu "
+                "boundaries_found=%d boundaries_expected=%d prefetch_depth=%d evict_advice=%d mmap_weights=%d\n",
+                (void *) this,
+                d ? 1 : 0,
+                cparams.layer_chunks,
+                (int) model.hparams.n_layer(),
+                (unsigned long long) (d ? d->setup_count : 0),
+                (unsigned long long) (d ? d->active_setup_count : 0),
+                (unsigned long long) (d ? d->switch_count : 0),
+                (unsigned long long) (d ? d->prefetch_count : 0),
+                d ? d->last_boundaries_found : 0,
+                d ? d->last_boundaries_expected : 0,
+                d ? d->prefetch_depth : 0,
+                d ? d->evict_advice : 0,
+                model.supports_mmap_weight_offload() ? 1 : 0);
+    }
     if (!model.hparams.no_alloc) {
         for (size_t i = 0; i < backend_ptrs.size(); ++i) {
             ggml_backend_t             backend = backend_ptrs[i];
@@ -1307,12 +1433,17 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             ggml_backend_sched_synchronize(sched.get());
         }
 
+        // sched_reserve() can make the very first real decode reuse an
+        // already-built graph. Install the layer callback here as well;
+        // otherwise --layer-chunks is silently inactive for every reused
+        // graph even though the request parameter is set.
+        setup_layer_chunk_offload();
+
         n_reused++;
     } else {
         res->reset();
 
         ggml_backend_sched_reset(sched.get());
-        ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
 
         //const auto t_start_us = ggml_time_us();
 
@@ -1325,6 +1456,10 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             ret = GGML_STATUS_FAILED;
             return nullptr;
         }
+
+        // install the scheduler eval callback (per-chunk weight offload, or the
+        // user callback unchanged when --layer-chunks is inactive)
+        setup_layer_chunk_offload();
 
         if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
             LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
@@ -1353,6 +1488,77 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     ret = GGML_STATUS_SUCCESS;
 
     return res;
+}
+
+// Compute per-chunk boundaries from the current graph and install the eval callback.
+// Called after the graph is built; must be called again whenever the graph is rebuilt.
+// Fallback (no layer-chunks / invalid config): install the user callback unchanged.
+void llama_context::setup_layer_chunk_offload() {
+    const int N = cparams.layer_chunks;
+    const int n_layer = model.hparams.n_layer();
+
+    const bool mmap_weights = model.supports_mmap_weight_offload();
+    const bool valid = N > 0 && n_layer > 0 && n_layer % N == 0 && mmap_weights;
+
+    if (!valid) {
+        ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
+        return;
+    }
+
+    const int lpc = n_layer / N;
+
+    if (!lc_offload) {
+        lc_offload = std::make_unique<llama_layer_chunk_offload>();
+    }
+    auto * d = lc_offload.get();
+    d->setup_count++;
+    d->active_setup_count++;
+    d->model         = &model;
+    d->layers_per_chunk = lpc;
+    d->prefetch_depth  = 1;
+    d->evict_advice    = llama_layer_chunk_evict_advice();
+    {
+        const char * pf = getenv("LLAMA_LAYER_CHUNKS_PREFETCH");
+        if (pf) {
+            int v = atoi(pf);
+            if (v >= 0 && v <= 8) d->prefetch_depth = v;
+        }
+    }
+    d->boundaries.assign(N, nullptr);
+    d->user_cb       = cparams.cb_eval;
+    d->user_cb_ud    = cparams.cb_eval_user_data;
+
+    auto * res = gf_res_prev.get();
+    auto * gf  = res->get_gf();
+
+    // boundary[c] = the first node whose src is the hidden state entering chunk c
+    // (= t_layer_inp[c*lpc]); that node is chunk c's first compute
+    int n_found = 0;
+    for (int c = 1; c < N; ++c) {
+        ggml_tensor * h_in = res->get_layer_inp(c*lpc);
+        if (!h_in) {
+            continue;
+        }
+        for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
+            ggml_tensor * node = ggml_graph_node(gf, i);
+            bool hit = false;
+            for (int j = 0; j < GGML_MAX_SRC; ++j) {
+                if (node->src[j] == h_in) {
+                    hit = true;
+                    break;
+                }
+            }
+            if (hit) {
+                d->boundaries[c] = node;
+                n_found++;
+                break;
+            }
+        }
+    }
+
+    ggml_backend_sched_set_eval_callback(sched.get(), llama_eval_cb_layer_chunk_offload, d);
+    d->last_boundaries_found = n_found;
+    d->last_boundaries_expected = N - 1;
 }
 
 int llama_context::encode(const llama_batch & batch_inp) {
@@ -1822,7 +2028,55 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
         ggml_status status;
 
+        // ---- Layer-chunk weight management ----
+        // N chunks, each layer_chunks controls the granularity.
+        // Weights are evicted before forward pass (MADV_PAGEOUT) so only
+        // actively-accessed layers consume physical memory.
+        // A no-mmap model has no file-backed host weights to page and must not
+        // enter the layer offload path (not even as zero-byte statistics).
+        int N = model.supports_mmap_weight_offload() ? cparams.layer_chunks : 0;
+
+        int total_layers = (int)model.hparams.n_layer();
+        if (N > 0 && total_layers % N != 0) {
+            LLAMA_LOG_WARN("%s: --layer-chunks %d does not divide n_layer=%d evenly; weight chunking disabled\n",
+                           __func__, N, total_layers);
+            N = 0;
+        }
+        if (N > 0) {
+            int layers_per_chunk = total_layers / N;
+
+            // Phase 1: evict all weights. With MADV_PAGEOUT:
+            // - file-backed (mmap) pages are evicted, reloaded on demand
+            // - anonymous pages fail gracefully (ENOMEM if no swap), data intact
+            // With LLAMA_LAYER_CHUNKS_ADVICE=cold -> MADV_COLD (stays resident)
+            model.madvise_all_weights(llama_layer_chunk_evict_advice());
+
+            // Optional idle sleep: allows benchmarks to measure RSS with
+            // weights evicted. Set LLAMA_LAYER_CHUNKS_IDLE_MS env var.
+            {
+                const char * idle_ms_str = getenv("LLAMA_LAYER_CHUNKS_IDLE_MS");
+                int idle_ms = idle_ms_str ? atoi(idle_ms_str) : 0;
+                if (idle_ms > 0) {
+                    LLAMA_LOG_INFO("%s: sleeping %d ms for idle RSS measurement\n",
+                                   __func__, idle_ms);
+                    usleep(idle_ms * 1000);
+                }
+            }
+
+            // Phase 2: pre-fault only the first chunk.
+            // Remaining chunks are faulted in on-demand during the forward pass.
+            // Since the forward pass is sequential, the kernel's readahead
+            // naturally pre-faults upcoming pages.
+            model.madvise_layer_weights(0, layers_per_chunk, MADV_WILLNEED);
+        }
+
         const auto * res = process_ubatch(ubatch, ctx_type_to_graph_type(cparams.ctx_type), mctx.get(), status);
+
+        // After forward pass: evict all weights again so that between
+        // ubatches the model footprint is minimized.
+        if (N > 0) {
+            model.madvise_all_weights(llama_layer_chunk_evict_advice());
+        }
 
         if (!res) {
             // the last ubatch failed or was aborted -> remove all positions of that ubatch from the memory module
@@ -1980,6 +2234,25 @@ int llama_context::decode(const llama_batch & batch_inp) {
         n_outputs_prev += n_outputs;
         n_tokens_prev  += ubatch.n_tokens;
     } while (mctx->next());
+
+    // Cluster-based KV cache: sequence-aware initialization happens in
+    // llama_kv_cache_cluster_context once the active sequence cohort has
+    // reached decode. Update clusters only after that gate is complete.
+    {
+        auto * cluster_mem = dynamic_cast<llama_kv_cache_cluster *>(memory.get());
+        if (cluster_mem && cparams.cluster_attn && cluster_mem->is_prefill_done()) {
+            cluster_mem->inc_step();
+            if (cluster_mem->steps_since_update() >= (uint32_t)cparams.cluster_update_interval) {
+                cluster_mem->cluster_update_from_cache();
+                cluster_mem->maybe_evict();
+                cluster_mem->reset_step_counter();
+            }
+            if (cluster_mem->steps_since_update() == 0 &&
+                (cluster_mem->get_last_cell_idx() % 128) < 4) {
+                cluster_mem->print_stats();
+            }
+        }
+    }
 
     // set to total number of outputs in the batch, for use in llama_get_logits_ith
     n_outputs = n_outputs_all;
@@ -2385,23 +2658,27 @@ llm_graph_params llama_context::graph_params(
                       const llama_ubatch & ubatch,
             const llama_memory_context_i * mctx,
                           llm_graph_type   gtype) const {
-    return {
-        /*.arch        =*/ model.arch,
-        /*.hparams     =*/ model.hparams,
-        /*.cparams     =*/ cparams,
-        /*.ubatch      =*/ ubatch,
-        /*.gtype       =*/ gtype,
-        /*.sched       =*/ sched.get(),
-        /*.backend_cpu =*/ backend_cpu,
-        /*.cvec        =*/ cvec.get(),
-        /*.loras       =*/ loras.get(),
-        /*.mctx        =*/ mctx,
-        /*.cross       =*/ &cross,
-        /*.samplers    =*/ sampling.samplers,
-        /*.n_outputs   =*/ n_outputs,
-        /*.cb          =*/ graph_get_cb(),
-        /*.res         =*/ res,
-    };
+    llm_graph_params gparams;
+    gparams.arch        = model.arch;
+    gparams.hparams     = model.hparams;
+    gparams.cparams     = cparams;
+    gparams.ubatch      = ubatch;
+    gparams.gtype       = gtype;
+    gparams.sched       = sched.get();
+    gparams.backend_cpu = backend_cpu;
+    gparams.cvec        = cvec.get();
+    gparams.loras       = loras.get();
+    gparams.mctx        = mctx;
+    gparams.cross       = &cross;
+    gparams.samplers    = sampling.samplers;
+    gparams.n_outputs   = n_outputs;
+    gparams.cb          = graph_get_cb();
+    gparams.res         = res;
+    gparams.il_start    = 0;
+    gparams.il_end      = -1;
+    gparams.input_hidden_state  = nullptr;
+    gparams.output_hidden_state = nullptr;
+    return gparams;
 }
 
 ggml_status llama_context::graph_compute(
@@ -3465,6 +3742,15 @@ llama_context_params llama_context_default_params() {
         /*.op_offload                  =*/ true,
         /*.swa_full                    =*/ true,
         /*.kv_unified                  =*/ false,
+        /*.cluster_attn                =*/ false,
+        /*.cluster_k                   =*/ 4,
+        /*.cluster_var_threshold        =*/ 0.5f,
+        /*.max_resident_clusters       =*/ 8,
+        /*.cluster_update_interval      =*/ 1,
+        /*.cluster_topk_tokens          =*/ 2048,
+        /*.cluster_max_prefetch         =*/ 4,
+        /*.cluster_score_select         =*/ true,
+        /*.layer_chunks                 =*/ 0,
         /*.sampler                     =*/ nullptr,
         /*.n_sampler                   =*/ 0,
         /*.ctx_other                   =*/ nullptr,
@@ -4000,6 +4286,26 @@ size_t llama_state_seq_set_data_ext(llama_context * ctx, const uint8_t * src, si
     ctx->synchronize();
 
     return ctx->state_seq_set_data(seq_id, src, size, flags);
+}
+
+bool llama_kv_cache_cluster_rebuild_after_restore(
+        llama_context * ctx,
+        llama_seq_id dest_seq_id) {
+    if (ctx == nullptr) {
+        LLAMA_LOG_ERROR("%s: null context\n", __func__);
+        return false;
+    }
+
+    ctx->synchronize();
+    auto * cluster_mem = dynamic_cast<llama_kv_cache_cluster *>(ctx->get_memory());
+    if (cluster_mem == nullptr) {
+        LLAMA_LOG_INFO(
+                "%s: cluster attention disabled; rebuild skipped for seq=%d\n",
+                __func__, (int) dest_seq_id);
+        return true;
+    }
+
+    return cluster_mem->rebuild_after_restore(dest_seq_id);
 }
 
 size_t llama_state_seq_save_file(llama_context * ctx, const char * filepath, llama_seq_id seq_id, const llama_token * tokens, size_t n_token_count) {

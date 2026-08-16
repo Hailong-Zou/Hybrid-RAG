@@ -8,10 +8,14 @@
 #include "llama-cparams.h"
 #include "llama-model-loader.h"
 
+#include <sys/mman.h>
+#include <unistd.h>
+
 #include "llama-kv-cache.h"
 #include "llama-kv-cache-iswa.h"
 #include "llama-kv-cache-dsa.h"
 #include "llama-kv-cache-dsv4.h"
+#include "llama-kv-cache-cluster.h"
 #include "llama-memory-hybrid.h"
 #include "llama-memory-hybrid-iswa.h"
 #include "llama-memory-recurrent.h"
@@ -1030,6 +1034,29 @@ llama_model::llama_model(const llama_model_params & params) : params(params), pi
 }
 
 llama_model::~llama_model() {
+    fprintf(stderr,
+            "LAYER_MADVISE_SUMMARY: model=%p "
+            "willneed_calls=%llu willneed_bytes=%llu willneed_failures=%llu willneed_errno=%d "
+            "pageout_calls=%llu pageout_bytes=%llu pageout_failures=%llu pageout_errno=%d "
+            "cold_calls=%llu cold_bytes=%llu cold_failures=%llu cold_errno=%d "
+            "other_calls=%llu other_bytes=%llu other_failures=%llu other_errno=%d "
+            "skipped_empty=%llu skipped_non_host=%llu skipped_non_mmap=%llu\n",
+            (void *) this,
+            (unsigned long long) madvise_calls[0].load(),
+            (unsigned long long) madvise_bytes[0].load(),
+            (unsigned long long) madvise_failures[0].load(), madvise_last_errno[0].load(),
+            (unsigned long long) madvise_calls[1].load(),
+            (unsigned long long) madvise_bytes[1].load(),
+            (unsigned long long) madvise_failures[1].load(), madvise_last_errno[1].load(),
+            (unsigned long long) madvise_calls[2].load(),
+            (unsigned long long) madvise_bytes[2].load(),
+            (unsigned long long) madvise_failures[2].load(), madvise_last_errno[2].load(),
+            (unsigned long long) madvise_calls[3].load(),
+            (unsigned long long) madvise_bytes[3].load(),
+            (unsigned long long) madvise_failures[3].load(), madvise_last_errno[3].load(),
+            (unsigned long long) madvise_skipped_empty.load(),
+            (unsigned long long) madvise_skipped_non_host.load(),
+            (unsigned long long) madvise_skipped_non_mmap.load());
     for (auto * lora : loras) {
         delete lora;
     }
@@ -1504,7 +1531,11 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         }
     }
 
-    ml.init_mappings(true, use_mlock ? &pimpl->mlock_mmaps : nullptr);
+    // with layer-chunks, weights are streamed from flash per chunk; pre-faulting the
+    // whole file at load (MAP_POPULATE + WILLNEED) would defeat the memory saving,
+    // so skip the eager prefetch and let mmap demand-page the weights on access
+    const bool prefetch = !params.no_mmap_prefetch;
+    ml.init_mappings(prefetch, use_mlock ? &pimpl->mlock_mmaps : nullptr);
     pimpl->mappings.reserve(ml.mappings.size());
 
     // create the backend buffers
@@ -2003,6 +2034,257 @@ const ggml_tensor * llama_model::get_tensor(const char * name) const {
     return it->second;
 }
 
+bool llama_model::supports_mmap_weight_offload() const {
+    return !pimpl->mappings.empty();
+}
+
+// ===== Layer-by-layer weight offloading via madvise =====
+
+namespace {
+
+enum class llama_weight_madvise_result {
+    SUCCESS,
+    FAILED,
+    SKIP_EMPTY,
+    SKIP_NON_HOST,
+    SKIP_NON_MMAP,
+};
+
+static llama_weight_madvise_result llama_madvise_mmap_tensor(
+        const llama_mmaps & mappings,
+        const ggml_tensor * tensor,
+        int advice,
+        size_t & advised_bytes,
+        int & error_code) {
+    advised_bytes = 0;
+    error_code = 0;
+
+    if (!tensor || !tensor->data) {
+        return llama_weight_madvise_result::SKIP_EMPTY;
+    }
+
+    const size_t tensor_size = ggml_nbytes(tensor);
+    if (tensor_size == 0) {
+        return llama_weight_madvise_result::SKIP_EMPTY;
+    }
+
+    // Layer-chunk paging is strictly a CPU/host mmap optimization.
+    // Never issue host madvise() against HTP/NPU/device buffers.
+    if (!tensor->buffer ||
+            !ggml_backend_buffer_is_host(tensor->buffer)) {
+        return llama_weight_madvise_result::SKIP_NON_HOST;
+    }
+
+    const uintptr_t tensor_start =
+            reinterpret_cast<uintptr_t>(tensor->data);
+
+    bool inside_model_mmap = false;
+
+    for (const auto & mapping : mappings) {
+        if (!mapping || !mapping->addr() || mapping->size() == 0) {
+            continue;
+        }
+
+        const uintptr_t map_start =
+                reinterpret_cast<uintptr_t>(mapping->addr());
+        const size_t map_size = mapping->size();
+
+        if (tensor_start < map_start) {
+            continue;
+        }
+
+        const uintptr_t offset = tensor_start - map_start;
+
+        // Avoid pointer/size overflow and require the complete tensor
+        // payload to belong to this model-file mmap.
+        if (offset <= map_size &&
+                tensor_size <= map_size - offset) {
+            inside_model_mmap = true;
+            break;
+        }
+    }
+
+    if (!inside_model_mmap) {
+        return llama_weight_madvise_result::SKIP_NON_MMAP;
+    }
+
+    long page_size_long = sysconf(_SC_PAGESIZE);
+    if (page_size_long <= 0) {
+        page_size_long = 4096;
+    }
+
+    const uintptr_t page_size =
+            static_cast<uintptr_t>(page_size_long);
+
+    const uintptr_t advise_start =
+            tensor_start - tensor_start % page_size;
+
+    const size_t prefix =
+            static_cast<size_t>(tensor_start - advise_start);
+
+    if (tensor_size > SIZE_MAX - prefix) {
+        error_code = EOVERFLOW;
+        return llama_weight_madvise_result::FAILED;
+    }
+
+    const size_t advise_size = tensor_size + prefix;
+
+    errno = 0;
+    const int ret = madvise(
+            reinterpret_cast<void *>(advise_start),
+            advise_size,
+            advice);
+
+    advised_bytes = advise_size;
+
+    if (ret != 0) {
+        error_code = errno;
+        return llama_weight_madvise_result::FAILED;
+    }
+
+    return llama_weight_madvise_result::SUCCESS;
+}
+
+} // namespace
+
+static int llama_weight_madvise_stats_index(int advice) {
+    if (advice == MADV_WILLNEED) return 0;
+    if (advice == MADV_PAGEOUT) return 1;
+    if (advice == MADV_COLD) return 2;
+    return 3;
+}
+
+void llama_model::madvise_all_weights(int advice) const {
+    size_t total_bytes = 0;
+
+    int successes = 0;
+    int failures = 0;
+    int skipped_empty = 0;
+    int skipped_non_host = 0;
+    int skipped_non_mmap = 0;
+    int last_errno = 0;
+
+    for (const auto & [name, tensor] : tensors_by_name) {
+        if (name.find("cache") != std::string::npos) {
+            continue;
+        }
+
+        size_t advised_bytes = 0;
+        int error_code = 0;
+
+        switch (llama_madvise_mmap_tensor(
+                pimpl->mappings,
+                tensor,
+                advice,
+                advised_bytes,
+                error_code)) {
+            case llama_weight_madvise_result::SUCCESS:
+                ++successes;
+                total_bytes += advised_bytes;
+                break;
+
+            case llama_weight_madvise_result::FAILED:
+                ++failures;
+                total_bytes += advised_bytes;
+                last_errno = error_code;
+                break;
+
+            case llama_weight_madvise_result::SKIP_EMPTY:
+                ++skipped_empty;
+                break;
+
+            case llama_weight_madvise_result::SKIP_NON_HOST:
+                ++skipped_non_host;
+                break;
+
+            case llama_weight_madvise_result::SKIP_NON_MMAP:
+                ++skipped_non_mmap;
+                break;
+        }
+    }
+
+    const int stats_index = llama_weight_madvise_stats_index(advice);
+    madvise_calls[stats_index].fetch_add(successes + failures);
+    madvise_bytes[stats_index].fetch_add(total_bytes);
+    madvise_failures[stats_index].fetch_add(failures);
+    if (last_errno != 0) madvise_last_errno[stats_index].store(last_errno);
+    madvise_skipped_empty.fetch_add(skipped_empty);
+    madvise_skipped_non_host.fetch_add(skipped_non_host);
+    madvise_skipped_non_mmap.fetch_add(skipped_non_mmap);
+}
+
+void llama_model::madvise_layer_weights(
+        int il_start,
+        int il_end,
+        int advice) const {
+    size_t total_bytes = 0;
+
+    int successes = 0;
+    int failures = 0;
+    int skipped_empty = 0;
+    int skipped_non_host = 0;
+    int skipped_non_mmap = 0;
+    int last_errno = 0;
+
+    for (const auto & [name, tensor] : tensors_by_name) {
+        if (name.find("cache") != std::string::npos) {
+            continue;
+        }
+
+        const auto blk_pos = name.find("blk.");
+        if (blk_pos == std::string::npos) {
+            continue;
+        }
+
+        const int layer = atoi(name.c_str() + blk_pos + 4);
+        if (layer < il_start || layer >= il_end) {
+            continue;
+        }
+
+        size_t advised_bytes = 0;
+        int error_code = 0;
+
+        switch (llama_madvise_mmap_tensor(
+                pimpl->mappings,
+                tensor,
+                advice,
+                advised_bytes,
+                error_code)) {
+            case llama_weight_madvise_result::SUCCESS:
+                ++successes;
+                total_bytes += advised_bytes;
+                break;
+
+            case llama_weight_madvise_result::FAILED:
+                ++failures;
+                total_bytes += advised_bytes;
+                last_errno = error_code;
+                break;
+
+            case llama_weight_madvise_result::SKIP_EMPTY:
+                ++skipped_empty;
+                break;
+
+            case llama_weight_madvise_result::SKIP_NON_HOST:
+                ++skipped_non_host;
+                break;
+
+            case llama_weight_madvise_result::SKIP_NON_MMAP:
+                ++skipped_non_mmap;
+                break;
+        }
+    }
+
+    const int stats_index = llama_weight_madvise_stats_index(advice);
+    madvise_calls[stats_index].fetch_add(successes + failures);
+    madvise_bytes[stats_index].fetch_add(total_bytes);
+    madvise_failures[stats_index].fetch_add(failures);
+    if (last_errno != 0) madvise_last_errno[stats_index].store(last_errno);
+    madvise_skipped_empty.fetch_add(skipped_empty);
+    madvise_skipped_non_host.fetch_add(skipped_non_host);
+    madvise_skipped_non_mmap.fetch_add(skipped_non_mmap);
+}
+
 float llama_model::get_rope_freq_base (const llama_cparams & cparams, int il) const {
     return hparams.is_swa(il) ? hparams.rope_freq_base_train_swa : cparams.rope_freq_base;
 }
@@ -2249,23 +2531,45 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                     } else {
                         GGML_ASSERT(!hparams.is_swa_any());
 
-                        res = new llama_kv_cache(
-                                *this,
-                                hparams,
-                                params.type_k,
-                                params.type_v,
-                                !cparams.flash_attn,
-                                cparams.offload_kqv,
-                                cparams.kv_unified,
-                                cparams.n_ctx_seq,
-                                cparams.n_seq_max,
-                                1,
-                                hparams.n_swa,
-                                hparams.swa_type,
-                                nullptr,
-                                filter,
-                                nullptr,
-                                nullptr);
+                        if (cparams.cluster_attn) {
+                            // Use cluster-enabled KV cache with offloading
+                            res = new llama_kv_cache_cluster(
+                                    *this,
+                                    hparams,
+                                    params.type_k,
+                                    params.type_v,
+                                    !cparams.flash_attn,
+                                    cparams.offload_kqv,
+                                    cparams.kv_unified,
+                                    cparams.n_ctx_seq,
+                                    cparams.n_seq_max,
+                                    1,
+                                    hparams.n_swa,
+                                    hparams.swa_type,
+                                    nullptr,
+                                    filter,
+                                    nullptr,
+                                    nullptr,
+                                    cparams);
+                        } else {
+                            res = new llama_kv_cache(
+                                    *this,
+                                    hparams,
+                                    params.type_k,
+                                    params.type_v,
+                                    !cparams.flash_attn,
+                                    cparams.offload_kqv,
+                                    cparams.kv_unified,
+                                    cparams.n_ctx_seq,
+                                    cparams.n_seq_max,
+                                    1,
+                                    hparams.n_swa,
+                                    hparams.swa_type,
+                                    nullptr,
+                                    filter,
+                                    nullptr,
+                                    nullptr);
+                        }
                     }
                 }
             }
@@ -2318,6 +2622,7 @@ llama_model_params llama_model_default_params() {
         /*.use_extra_bufts             =*/ true,
         /*.no_host                     =*/ false,
         /*.no_alloc                    =*/ false,
+        /*.no_mmap_prefetch            =*/ false,
     };
 
     return result;

@@ -330,10 +330,17 @@ public:
     ggml_tensor * get_k_idxs() const { return self_k_idxs; }
     ggml_tensor * get_v_idxs() const { return self_v_idxs; }
 
+    ggml_tensor * get_k_idxs_sparse() const { return self_k_idxs_sparse; }
+    ggml_tensor * get_v_idxs_sparse() const { return self_v_idxs_sparse; }
+
     ggml_tensor * get_kq_mask() const { return self_kq_mask_cnv; }
 
     ggml_tensor * self_k_idxs = nullptr; // I64 [n_batch]
     ggml_tensor * self_v_idxs = nullptr; // I64 [n_batch] or [n_batch*n_embd_v_gqa]
+
+    // Sparse attention: I32 index tensors for ggml_get_rows
+    ggml_tensor * self_k_idxs_sparse = nullptr; // I32 [n_sparse, n_stream]
+    ggml_tensor * self_v_idxs_sparse = nullptr; // I32 [n_sparse, n_stream] or 4D for transposed V
 
     ggml_tensor * self_kq_mask     = nullptr; // F32/F16 [n_kv, n_batch/n_stream, 1, n_stream]
     ggml_tensor * self_kq_mask_cnv = nullptr; //         [n_kv, n_batch/n_stream, 1, n_stream]
@@ -370,10 +377,14 @@ public:
     bool can_reuse(const llm_graph_params & params) override;
 
     ggml_tensor * get_k_idxs() const { return self_k_idxs; }
+    ggml_tensor * get_k_idxs_sparse() const { return self_k_idxs_sparse; }
 
     ggml_tensor * get_kq_mask() const { return self_kq_mask_cnv; }
 
     ggml_tensor * self_k_idxs = nullptr; // I64 [n_batch]
+
+    // Sparse attention: I32 index tensor for ggml_get_rows
+    ggml_tensor * self_k_idxs_sparse = nullptr; // I32 [n_sparse, n_stream]
 
     ggml_tensor * self_kq_mask     = nullptr; // F32/F16 [n_kv, n_batch/n_stream, 1, n_stream]
     ggml_tensor * self_kq_mask_cnv = nullptr; //         [n_kv, n_batch/n_stream, 1, n_stream]
@@ -685,6 +696,16 @@ struct llm_graph_params {
     const llama_memory_context_i * mctx;
     const llama_cross            * cross;
 
+    // layer range for chunked execution: il_start inclusive, il_end exclusive
+    // default: il_end = -1 means use n_layer
+    int il_start = 0;
+    int il_end   = -1;
+
+    // optional: pre-computed hidden state from previous chunk (for pipeline)
+    struct ggml_tensor * input_hidden_state = nullptr;
+    // optional: output tensor to capture hidden state for next chunk
+    struct ggml_tensor * output_hidden_state = nullptr;
+
     std::map<llama_seq_id, llama_sampler *> samplers;
 
     static bool samplers_equal(
@@ -888,6 +909,8 @@ struct llm_graph_context {
 
     const int64_t n_embd;
     const int64_t n_layer;
+    int n_layer_end() const { return il_end_ < 0 ? (int)n_layer : il_end_; }
+    int n_layer_start() const { return il_start_; }
     const int64_t n_layer_nextn;
     const int64_t n_rot;
     const int64_t n_ctx;       // user-specified context size (can be different from n_ctx_train)
@@ -933,6 +956,9 @@ struct llm_graph_context {
 
     ggml_context * ctx0 = nullptr;
     ggml_cgraph  * gf   = nullptr;
+
+    int il_start_ = 0;
+    int il_end_   = -1;
 
     llm_graph_context(const llm_graph_params & params);
     virtual ~llm_graph_context() = default;

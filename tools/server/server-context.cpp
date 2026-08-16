@@ -1235,7 +1235,18 @@ private:
             params_base.load_progress_callback_user_data = &load_progress_text;
         }
 
-        llama_init = common_init_from_params(params_base);
+        // Layer paging belongs to the mmap-backed CPU decode model.  The NPU
+        // producer is normally --no-mmap and must never enter layer offload.
+        common_params params_target = params_base;
+        if (params_base.generation_decode_cpu && params_base.layer_chunks > 0) {
+            params_target.layer_chunks = 0;
+            SRV_INF(
+                    "LAYER_OFFLOAD_ROUTE: producer_layer_chunks=0 "
+                    "decode_cpu_layer_chunks=%d\n",
+                    params_base.layer_chunks);
+        }
+
+        llama_init = common_init_from_params(params_target);
 
         model_tgt = llama_init->model();
         ctx_tgt   = llama_init->context();
@@ -2068,6 +2079,14 @@ private:
                 decode_context_params.n_ctx =
                         static_cast<uint32_t>(slot.n_ctx);
                 decode_context_params.n_seq_max = 1;
+                decode_context_params.layer_chunks =
+                        params_base.layer_chunks;
+                SRV_INF(
+                        "GENERATION_DECODE_CONTEXT_CONFIG: path=stored_handoff "
+                        "layer_chunks=%d cluster_attn=%d n_ctx=%u n_seq_max=%u\n",
+                        decode_context_params.layer_chunks,
+                        (int) decode_context_params.cluster_attn,
+                        decode_context_params.n_ctx, decode_context_params.n_seq_max);
 
                 llama_model * decode_model = nullptr;
 
@@ -4531,6 +4550,14 @@ private:
                 decode_context_params.n_ctx =
                         static_cast<uint32_t>(slot.n_ctx);
                 decode_context_params.n_seq_max = 1;
+                decode_context_params.layer_chunks =
+                        params_base.layer_chunks;
+                SRV_INF(
+                        "GENERATION_DECODE_CONTEXT_CONFIG: path=request_handoff "
+                        "layer_chunks=%d cluster_attn=%d n_ctx=%u n_seq_max=%u\n",
+                        decode_context_params.layer_chunks,
+                        (int) decode_context_params.cluster_attn,
+                        decode_context_params.n_ctx, decode_context_params.n_seq_max);
 
                 llama_model * decode_model = nullptr;
 

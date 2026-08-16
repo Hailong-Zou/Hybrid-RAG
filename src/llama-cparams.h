@@ -58,4 +58,17 @@ struct llama_cparams {
     void * cb_eval_user_data;
 
     llama_context * ctx_other;
+
+    // cluster-based KV cache attention + offloading
+    bool  cluster_attn = false;          // enable cluster-based sparse attention
+    int   cluster_k = 4;                 // Top-K clusters to attend
+    float cluster_var_threshold = 0.5f;  // variance threshold for cluster split
+    int   max_resident_clusters = 8;     // max clusters kept in memory
+    int   cluster_update_interval = 1;   // steps between cluster updates (1=every step)
+    int   cluster_topk_tokens = 2048;    // max tokens for score-based sparse attention (0=use all cluster tokens)
+    int   cluster_max_prefetch = 4;      // max clusters to prefetch ahead
+    bool  cluster_score_select = true;   // use score-based token selection (vs pure LRU)
+
+    // layer-by-layer weight offloading: 0=disabled, N=split into N chunks (must divide n_layer)
+    int   layer_chunks = 0;
 };

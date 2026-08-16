@@ -571,6 +571,19 @@ struct common_params {
     bool swa_full          = false; // use full-size SWA cache (https://github.com/ggml-org/llama.cpp/pull/13194#issuecomment-2868343055)
     bool kv_unified        = false; // enable unified KV cache
 
+    // cluster-based KV cache attention + offloading
+    bool  cluster_attn            = false;
+    int   cluster_k               = 4;
+    float cluster_var_threshold   = 0.5f;
+    int   max_resident_clusters   = 8;
+    int   cluster_update_interval = 1;
+    int   cluster_topk_tokens     = 2048;
+    int   cluster_max_prefetch    = 4;
+    bool  cluster_score_select    = true;
+
+    // layer-by-layer weight offloading
+    int   layer_chunks            = 0;
+
     bool input_prefix_bos  = false; // prefix BOS to user inputs, preceding input_prefix
     bool use_mmap          = true;  // enable mmap to use filesystem cache
     bool use_direct_io     = false; // read from disk without buffering
