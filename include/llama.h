@@ -402,7 +402,7 @@ extern "C" {
         bool  cluster_score_select;    // use score-based token selection
 
         // layer-by-layer weight offloading
-        int   layer_chunks;           // 0=disabled, N=chunks (must divide n_layer)
+        int   layer_chunks;           // 0=disabled, N=layers loaded per step (skip-aware: a skip-graph only pins its non-skipped layers)
 
         // [EXPERIMENTAL]
         // backend sampler chain configuration (make sure the caller keeps the sampler chains alive)
@@ -1018,6 +1018,35 @@ extern "C" {
     // Set whether to use causal attention or not
     // If set to true, the model will only attend to the past tokens
     LLAMA_API void llama_set_causal_attn(struct llama_context * ctx, bool causal_attn);
+
+    // Set the set of layers to skip entirely (self-speculative drafting / ConfLayers).
+    // A skipped layer is bypassed: residual pass-through, no attention/FFN, and no KV write.
+    // Pass layer_ids == nullptr / n_layer_ids == 0 to disable skipping. The graph is rebuilt on the next decode.
+    LLAMA_API void llama_set_layer_skip(struct llama_context * ctx, const int32_t * layer_ids, int32_t n_layer_ids);
+
+    // Set the per-layer "never evict" set for --layer-chunks weight offloading.
+    // Layers in this set stay resident in RAM (shared by every graph); all other layers
+    // stream from flash in chunks. Only meaningful when layer_chunks > 0. Pass
+    // layer_ids == nullptr / n_layer_ids == 0 to clear. The graph is rebuilt on the next decode.
+    LLAMA_API void llama_set_resident_layers(struct llama_context * ctx, const int32_t * layer_ids, int32_t n_layer_ids);
+
+    // Enable/disable capture of the raw pre-residual attention ("attn_out") and feed-forward
+    // ("ffn_out") outputs of every layer during the next llama_decode() (ConfLayers validation).
+    // Enable before the decode, read the results with llama_get_intermediate_output(), then disable.
+    // Enabling or disabling forces a graph rebuild on the next decode.
+    LLAMA_API void llama_set_intermediate_capture(struct llama_context * ctx, bool enable);
+
+    // Copies the raw output captured for layer `il` into `data` as float[n_tokens][n_embd]
+    // (row-major). `name` is "attn_out" or "ffn_out". Returns the number of tokens copied, or 0
+    // if `il` was not captured (e.g. the layer was skipped during the capture decode).
+    LLAMA_API int32_t llama_get_intermediate_output(struct llama_context * ctx, const char * name, int32_t il, float * data, int32_t max_rows);
+
+    // Force the cluster-based KV cache to always return the full K/V view, disabling sparse
+    // cluster attention (get_k/get_v no longer return a cluster-selected token subset). Cluster
+    // bookkeeping (init/update/persist/evict) still runs. Required by the ConfLayers module:
+    // its multi-seq tree verification needs the full KV, and its draft phase must not use
+    // clustered attention. No-op when the context's memory is not a cluster cache.
+    LLAMA_API void llama_set_cluster_full_attn(struct llama_context * ctx, bool force);
 
     // Set whether the model is in warmup mode or not
     // If true, all model tensors are activated during llama_decode() to load and cache their weights.

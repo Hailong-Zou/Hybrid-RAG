@@ -119,6 +119,10 @@ struct llama_context {
     void set_embeddings_layer_inp(uint32_t lid, bool enable);
     void set_nextn_layer_offset(int32_t offset);
     void set_causal_attn(bool value);
+    void set_layer_skip(const std::vector<int32_t> & skip_layers);
+    void set_resident_layers(const std::vector<int32_t> & resident_layers);
+    void set_intermediate_capture(bool value);
+    int32_t get_intermediate_output(const char * name, int32_t il, float * data, int32_t max_rows);
     void set_warmup(bool value);
 
     void set_adapters_lora(llama_adapter_lora ** adapters, size_t n_adapters, float * scales);
@@ -351,6 +355,13 @@ private:
     ggml_backend_sched_ptr sched;
 
     bool sched_need_reserve = true;
+
+    // ConfLayers intermediate capture: raw pre-residual attention/FFN output per layer,
+    // recorded by the graph callback during a capture-enabled decode. Reset on enable.
+    // mutable: recorded from the const graph callback (graph_get_cb).
+    bool capture_intermediate = false;
+    mutable std::vector<ggml_tensor *> cap_attn; // [il] raw attn output tensor (may be null)
+    mutable std::vector<ggml_tensor *> cap_ffn;  // [il] raw ffn output tensor (may be null)
 
     ggml_backend_t backend_cpu = nullptr;
     std::vector<ggml_backend_ptr> backends;

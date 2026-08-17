@@ -1388,8 +1388,10 @@ void llama_kv_cache_cluster_context::ensure_positions()const{if(!cached_position
 
 // Framework hooks
 bool llama_kv_cache_cluster_context::use_sparse_attn() const {
-    return kv_cluster_ && !current_ubatch_is_prefill() &&
-           kv_cluster_->sparse_ready_for(current_seq_ids());
+    return kv_cluster_
+        && !current_ubatch_is_prefill()
+        && kv_cluster_->sparse_ready_for(current_seq_ids())
+        && !kv_cluster_->force_full_attn();
 }
 
 uint32_t llama_kv_cache_cluster_context::get_n_kv_sparse() const {

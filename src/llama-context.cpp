@@ -18,6 +18,7 @@
 #include "llama-ext.h"
 #include "llama.h"
 
+#include <algorithm>
 #include <cinttypes>
 #include <cstdio>
 #include <cmath>
@@ -27,14 +28,22 @@
 #include <string>
 
 // Per-chunk weight offload: when --layer-chunks N is active, the scheduler's eval
-// callback makes the graph compute in N layer-chunks. As soon as a chunk's nodes
-// finish, its weights are madvise(PAGEOUT)'d and the next chunk is prefetched,
-// so only ~1/N of the model weights are resident at any time.
+// callback makes the graph compute in chunks of N computed layers each. As soon as a
+// chunk's nodes finish, its weights are madvise(PAGEOUT)'d and the next chunk is
+// prefetched, so only ~N layers of the model weights are resident at any time.
+// The chunking is skip-aware: in a skip-graph (ConfLayers draft) only the non-skipped
+// layers are counted and pinned, so the draft's working set jumps over the skipped
+// layers while the full model (verify) chunks over every layer.
 struct llama_layer_chunk_offload {
     const llama_model * model = nullptr;
-    int layers_per_chunk = 0;
-    // boundaries[c] = first graph node of chunk c (c in [1, N)); [0] unused
+    int layers_per_chunk = 0; // N = layers loaded per step
+    // boundaries[c] = first graph node of chunk c (c in [1, n_chunks)); [0] unused
     std::vector<ggml_tensor *> boundaries;
+    // ranges[c] = actual layer index range [lo, hi) of chunk c's active layers
+    std::vector<std::pair<int,int>> ranges;
+    // protect set for this offload: the graph's skip set (draft jumps over it) or the
+    // resident set (never evict, stream only the complement). madvise skips these layers.
+    std::vector<bool> layer_skip;
     // how many chunks ahead to prefetch during the current chunk's compute;
     // overlaps the next chunk's flash read with this chunk's matmuls
     int prefetch_depth = 1;
@@ -100,9 +109,11 @@ static bool llama_eval_cb_layer_chunk_offload(ggml_tensor * t, bool ask, void * 
                 ? (chunk_cb_entry_us - d->last_boundary_cb_exit_us) / 1000.0
                 : 0.0;
 
-    if (c >= 1 && d->model && d->layers_per_chunk > 0) {
-        const int lpc = d->layers_per_chunk;
-        const int n_chunks = (int) d->boundaries.size();
+    if (c >= 1 &&
+            d->model &&
+            d->layers_per_chunk > 0 &&
+            (int) d->ranges.size() > c) {
+        const int n_chunks = (int) d->ranges.size();
         d->switch_count++;
 
         double mmap_evict_ms = 0.0;
@@ -118,14 +129,20 @@ static bool llama_eval_cb_layer_chunk_offload(ggml_tensor * t, bool ask, void * 
             int64_t t0 = ggml_time_us();
 
             d->model->madvise_layer_weights(
-                    (c - 1)*lpc, c*lpc, d->evict_advice);
+                    d->ranges[c - 1].first,
+                    d->ranges[c - 1].second,
+                    d->evict_advice,
+                    d->layer_skip);
 
             mmap_evict_ms = (ggml_time_us() - t0) / 1000.0;
 
             t0 = ggml_time_us();
 
             d->model->madvise_layer_weights(
-                    c*lpc, (c + 1)*lpc, MADV_WILLNEED);
+                    d->ranges[c].first,
+                    d->ranges[c].second,
+                    MADV_WILLNEED,
+                    d->layer_skip);
 
             mmap_current_willneed_ms =
                     (ggml_time_us() - t0) / 1000.0;
@@ -137,7 +154,10 @@ static bool llama_eval_cb_layer_chunk_offload(ggml_tensor * t, bool ask, void * 
                 if (nc < n_chunks) {
                     d->prefetch_count++;
                     d->model->madvise_layer_weights(
-                            nc*lpc, (nc + 1)*lpc, MADV_WILLNEED);
+                            d->ranges[nc].first,
+                            d->ranges[nc].second,
+                            MADV_WILLNEED,
+                            d->layer_skip);
                 }
             }
 
@@ -1472,6 +1492,71 @@ void llama_context::set_causal_attn(bool value) {
     sched_need_reserve = true;
 }
 
+void llama_context::set_layer_skip(const std::vector<int32_t> & skip_layers) {
+    std::vector<bool> mask(model.hparams.n_layer(), false);
+
+    for (int32_t il : skip_layers) {
+        if (il >= 0 && il < (int32_t) mask.size()) {
+            mask[il] = true;
+        }
+    }
+
+    if (mask == cparams.layer_skip) {
+        return; // unchanged: keep the graph and offload setup as-is
+    }
+
+    cparams.layer_skip = std::move(mask);
+
+    // a different skip set changes the graph topology, which the next decode rebuilds
+    // via can_reuse(). No sched_need_reserve here: the reserve graphs are worst-case
+    // full-model shapes and do not depend on the skip mask.
+}
+
+void llama_context::set_resident_layers(const std::vector<int32_t> & resident_layers) {
+    cparams.resident_layers.assign(model.hparams.n_layer(), false);
+    int n_resident = 0;
+    for (int32_t il : resident_layers) {
+        if (il >= 0 && il < (int32_t) cparams.resident_layers.size() && !cparams.resident_layers[il]) {
+            cparams.resident_layers[il] = true;
+            n_resident++;
+        }
+    }
+
+    if (cparams.layer_chunks <= 0 || n_resident == 0) {
+        // empty resident -> legacy all-stream behavior; the offload mask changes -> rebuild
+        sched_need_reserve = true;
+        return;
+    }
+
+    // establish the resident/stream split before the next decode: evict the stream set
+    // first, then fault in the resident set (low peak)
+    model.madvise_layer_weights(0, model.hparams.n_layer(), MADV_PAGEOUT, cparams.resident_layers);
+    std::vector<bool> stream(cparams.resident_layers.size());
+    int n_stream = 0;
+    for (size_t i = 0; i < stream.size(); ++i) {
+        stream[i] = !cparams.resident_layers[i];
+        if (stream[i]) n_stream++;
+    }
+    model.madvise_layer_weights(0, model.hparams.n_layer(), MADV_WILLNEED, stream);
+
+    // a different resident set changes the chunk boundaries -> rebuild
+    sched_need_reserve = true;
+    LLAMA_LOG_INFO("%s: resident layers set: %d layers, stream %d\n", __func__, n_resident, n_stream);
+}
+
+void llama_context::set_intermediate_capture(bool value) {
+    if (capture_intermediate == value) {
+        return;
+    }
+
+    capture_intermediate = value;
+    cap_attn.assign(LLAMA_MAX_LAYERS, nullptr);
+    cap_ffn.assign(LLAMA_MAX_LAYERS, nullptr);
+
+    // marking extra tensors as outputs changes the graph topology -> rebuild on the next decode
+    sched_need_reserve = true;
+}
+
 void llama_context::set_warmup(bool value) {
     LLAMA_LOG_DEBUG("%s: value = %d\n", __func__, value);
 
@@ -1694,25 +1779,54 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 // Called after the graph is built; must be called again whenever the graph is rebuilt.
 // Fallback (no layer-chunks / invalid config): install the user callback unchanged.
 void llama_context::setup_layer_chunk_offload() {
-    const int N = cparams.layer_chunks;
+    const int lpc = cparams.layer_chunks; // layers loaded per step
     const int n_layer = model.hparams.n_layer();
 
     const bool mmap_weights   = model.supports_mmap_weight_offload();
     const bool repack_weights = model.supports_repack_chunk_residency();
 
-    const bool valid =
-            N > 0 &&
-            n_layer > 0 &&
-            n_layer % N == 0 &&
-            (mmap_weights || repack_weights);
+    // protected set: resident layers take priority; otherwise protect the
+    // layers skipped by the current ConFLayer graph.
+    const bool has_resident = std::any_of(
+            cparams.resident_layers.begin(),
+            cparams.resident_layers.end(),
+            [](bool b) { return b; });
+    const bool has_skip = std::any_of(
+            cparams.layer_skip.begin(),
+            cparams.layer_skip.end(),
+            [](bool b) { return b; });
 
-    if (!valid) {
+    const std::vector<bool> & protect =
+            has_resident ? cparams.resident_layers : cparams.layer_skip;
+
+    // REPACK residency is the existing full-graph/prefill path. Once a
+    // ConFLayer skip/resident mask is active, decode follows zhenyu's
+    // protect-aware mmap streaming path instead.
+    const bool repack_allowed =
+            repack_weights && !has_resident && !has_skip;
+
+    std::vector<int> active;
+    if (lpc > 0 &&
+            n_layer > 0 &&
+            (mmap_weights || repack_allowed) &&
+            (!has_resident || !has_skip)) {
+        active.reserve(n_layer);
+        for (int il = 0; il < n_layer; ++il) {
+            if (il < (int) protect.size() && protect[il]) {
+                continue;
+            }
+            active.push_back(il);
+        }
+    }
+
+    if (active.empty()) {
         ggml_backend_sched_set_eval_callback(
                 sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
         return;
     }
 
-    const int lpc = n_layer / N;
+    const int n_active  = (int) active.size();
+    const int n_chunks  = (n_active + lpc - 1) / lpc; // ceil; the last chunk may be partial
 
     if (!lc_offload) {
         lc_offload = std::make_unique<llama_layer_chunk_offload>();
@@ -1722,11 +1836,12 @@ void llama_context::setup_layer_chunk_offload() {
     d->active_setup_count++;
     d->model         = &model;
     d->layers_per_chunk = lpc;
-    d->prefetch_depth   = 1;
-    d->evict_advice     = llama_layer_chunk_evict_advice();
-    d->mmap_residency   = mmap_weights;
-    d->repack_residency = repack_weights;
-    d->repack_failed    = false;
+    d->layer_skip        = protect;
+    d->prefetch_depth    = 1;
+    d->evict_advice      = llama_layer_chunk_evict_advice();
+    d->mmap_residency    = mmap_weights;
+    d->repack_residency  = repack_allowed;
+    d->repack_failed     = false;
     d->last_boundary_cb_exit_us = 0;
     {
         const char * pf = getenv("LLAMA_LAYER_CHUNKS_PREFETCH");
@@ -1735,7 +1850,13 @@ void llama_context::setup_layer_chunk_offload() {
             if (v >= 0 && v <= 8) d->prefetch_depth = v;
         }
     }
-    d->boundaries.assign(N, nullptr);
+    d->boundaries.assign(n_chunks, nullptr);
+    d->ranges.clear();
+    for (int c = 0; c < n_chunks; ++c) {
+        const int lo = active[c*lpc];
+        const int hi = active[std::min((c+1)*lpc, n_active) - 1] + 1; // exclusive; covers the chunk's active layers
+        d->ranges.emplace_back(lo, hi);
+    }
     d->user_cb       = cparams.cb_eval;
     d->user_cb_ud    = cparams.cb_eval_user_data;
 
@@ -1743,10 +1864,11 @@ void llama_context::setup_layer_chunk_offload() {
     auto * gf  = res->get_gf();
 
     // boundary[c] = the first node whose src is the hidden state entering chunk c
-    // (= t_layer_inp[c*lpc]); that node is chunk c's first compute
+    // (= t_layer_inp[active[c*lpc]]); that node is chunk c's first compute.
+    // The loop only ever touches active layers, so boundaries always resolve.
     int n_found = 0;
-    for (int c = 1; c < N; ++c) {
-        ggml_tensor * h_in = res->get_layer_inp(c*lpc);
+    for (int c = 1; c < n_chunks; ++c) {
+        ggml_tensor * h_in = res->get_layer_inp(active[c*lpc]);
         if (!h_in) {
             continue;
         }
@@ -1768,8 +1890,21 @@ void llama_context::setup_layer_chunk_offload() {
     }
 
     ggml_backend_sched_set_eval_callback(sched.get(), llama_eval_cb_layer_chunk_offload, d);
-    d->last_boundaries_found = n_found;
-    d->last_boundaries_expected = N - 1;
+    d->last_boundaries_found    = n_found;
+    d->last_boundaries_expected = n_chunks - 1;
+
+    LLAMA_LOG_INFO(
+            "%s: layer-chunk offload active: "
+            "lpc=%d chunks=%d active=%d boundaries=%d/%d "
+            "mmap=%d repack=%d\n",
+            __func__,
+            lpc,
+            n_chunks,
+            n_active,
+            n_found,
+            n_chunks - 1,
+            d->mmap_residency ? 1 : 0,
+            d->repack_residency ? 1 : 0);
 }
 
 int llama_context::encode(const llama_batch & batch_inp) {
@@ -1789,7 +1924,7 @@ int llama_context::encode(const llama_batch & batch_inp) {
     const int64_t n_vocab = model.vocab.n_tokens();
 
     // note: during encode, we always pass the full sequence starting from pos = 0
-    if (!balloc->init(batch_inp, model.vocab, nullptr, n_embd, cparams.kv_unified ? LLAMA_MAX_SEQ : cparams.n_seq_max, true)) {
+    if (!balloc->init(batch_inp, model.vocab, nullptr, n_embd, cparams.n_seq_max, true)) {
         LLAMA_LOG_ERROR("%s: failed to initialize batch\n", __func__);
         return -1;
     }
@@ -2101,7 +2236,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
     const bool output_all   = cparams.embeddings;
     const bool has_samplers = !sampling.samplers.empty();
 
-    const uint32_t n_seq_max = cparams.kv_unified ? LLAMA_MAX_SEQ : cparams.n_seq_max;
+    const uint32_t n_seq_max = cparams.n_seq_max;
 
     // TODO: avoid this workaround in the future
     if (has_samplers && batch_inp.logits) {
@@ -2309,27 +2444,46 @@ int llama_context::decode(const llama_batch & batch_inp) {
         }
 
         // ---- Layer-chunk weight management ----
-        // N chunks, each layer_chunks controls the granularity.
-        // Weights are evicted before forward pass (MADV_PAGEOUT) so only
-        // actively-accessed layers consume physical memory.
-        // A no-mmap model has no file-backed host weights to page and must not
-        // enter the layer offload path (not even as zero-byte statistics).
-        int N = model.supports_mmap_weight_offload() ? cparams.layer_chunks : 0;
+        // mmap layer streaming is independent from the physical
+        // two-slot REPACK residency used by the existing full-graph path.
+        // No-mmap models must not enter the madvise path.
+        const int lpc =
+                model.supports_mmap_weight_offload()
+                    ? cparams.layer_chunks
+                    : 0;
+        const int total_layers = (int) model.hparams.n_layer();
 
-        int total_layers = (int)model.hparams.n_layer();
-        if (N > 0 && total_layers % N != 0) {
-            LLAMA_LOG_WARN("%s: --layer-chunks %d does not divide n_layer=%d evenly; weight chunking disabled\n",
-                           __func__, N, total_layers);
-            N = 0;
+        // protected set: resident (never evict) if set, else the graph's skip set
+        // "set" means any true entry: a cleared mask is a size-n_layer all-false vector,
+        // so .empty() is not a valid test.
+        const bool has_resident = std::any_of(cparams.resident_layers.begin(), cparams.resident_layers.end(),
+                                              [](bool b) { return b; });
+        const bool has_skip     = std::any_of(cparams.layer_skip.begin(), cparams.layer_skip.end(),
+                                              [](bool b) { return b; });
+        const std::vector<bool> & protect = has_resident ? cparams.resident_layers : cparams.layer_skip;
+
+        std::vector<int> active;
+        if (lpc > 0 && total_layers > 0 && (!has_resident || !has_skip)) {
+            active.reserve(total_layers);
+            for (int il = 0; il < total_layers; ++il) {
+                if (il < (int) protect.size() && protect[il]) continue;
+                active.push_back(il);
+            }
         }
-        if (N > 0) {
-            int layers_per_chunk = total_layers / N;
+        if (lpc > 0 && !active.empty()) {
+            const int n_active = (int) active.size();
+            const int n0 = std::min(n_active, lpc); // first chunk may cover fewer active layers
 
-            // Phase 1: evict all weights. With MADV_PAGEOUT:
+            // Phase 1: evict the stream set (everything but the resident layers). With
+            // MADV_PAGEOUT:
             // - file-backed (mmap) pages are evicted, reloaded on demand
             // - anonymous pages fail gracefully (ENOMEM if no swap), data intact
             // With LLAMA_LAYER_CHUNKS_ADVICE=cold -> MADV_COLD (stays resident)
-            model.madvise_all_weights(llama_layer_chunk_evict_advice());
+            if (!has_resident) {
+                model.madvise_all_weights(llama_layer_chunk_evict_advice());
+            } else {
+                model.madvise_layer_weights(0, total_layers, llama_layer_chunk_evict_advice(), cparams.resident_layers);
+            }
 
             // Optional idle sleep: allows benchmarks to measure RSS with
             // weights evicted. Set LLAMA_LAYER_CHUNKS_IDLE_MS env var.
@@ -2347,15 +2501,19 @@ int llama_context::decode(const llama_batch & batch_inp) {
             // Remaining chunks are faulted in on-demand during the forward pass.
             // Since the forward pass is sequential, the kernel's readahead
             // naturally pre-faults upcoming pages.
-            model.madvise_layer_weights(0, layers_per_chunk, MADV_WILLNEED);
+            model.madvise_layer_weights(active[0], active[n0-1] + 1, MADV_WILLNEED, protect);
         }
 
         const auto * res = process_ubatch(ubatch, ctx_type_to_graph_type(cparams.ctx_type), mctx.get(), status);
 
-        // After forward pass: evict all weights again so that between
-        // ubatches the model footprint is minimized.
-        if (N > 0) {
-            model.madvise_all_weights(llama_layer_chunk_evict_advice());
+        // After forward pass: evict the stream set again so that between
+        // ubatches the model footprint is minimized (resident layers stay).
+        if (lpc > 0 && !active.empty()) {
+            if (!has_resident) {
+                model.madvise_all_weights(llama_layer_chunk_evict_advice());
+            } else {
+                model.madvise_layer_weights(0, total_layers, llama_layer_chunk_evict_advice(), cparams.resident_layers);
+            }
         }
 
         if (!res) {
@@ -2958,6 +3116,9 @@ llm_graph_params llama_context::graph_params(
     gparams.il_end      = -1;
     gparams.input_hidden_state  = nullptr;
     gparams.output_hidden_state = nullptr;
+    gparams.layer_skip  = cparams.layer_skip;
+    gparams.capture_attn = capture_intermediate ? &cap_attn : nullptr;
+    gparams.capture_ffn  = capture_intermediate ? &cap_ffn  : nullptr;
     return gparams;
 }
 
@@ -2996,6 +3157,15 @@ llm_graph_cb llama_context::graph_get_cb() const {
             ggml_format_name(cur, "%s-%d", name, il);
         } else {
             ggml_set_name(cur, name);
+        }
+
+        // ConfLayers intermediate capture: record the raw pre-residual outputs
+        if (capture_intermediate && il >= 0 && il < LLAMA_MAX_LAYERS) {
+            if (strcmp(name, "attn_out") == 0) {
+                cap_attn[il] = cur;
+            } else if (strcmp(name, "ffn_out") == 0) {
+                cap_ffn[il] = cur;
+            }
         }
 
         // norm may be automatically assigned to the backend of the previous layer, increasing data transfer between backends
@@ -3854,7 +4024,7 @@ void llama_context::opt_epoch_iter(
             batch.logits  [pos_batch]    = true;
         }
 
-        if (!balloc->init(batch, model.vocab, nullptr, model.hparams.n_embd_inp(), cparams.kv_unified ? LLAMA_MAX_SEQ : cparams.n_seq_max, true)) {
+        if (!balloc->init(batch, model.vocab, nullptr, model.hparams.n_embd_inp(), cparams.n_seq_max, true)) {
             LLAMA_LOG_ERROR("%s: failed to initialize batch\n", __func__);
             return;
         }
@@ -4199,6 +4369,91 @@ void llama_set_embeddings(llama_context * ctx, bool embeddings) {
 
 void llama_set_causal_attn(llama_context * ctx, bool causal_attn) {
     ctx->set_causal_attn(causal_attn);
+}
+
+void llama_set_layer_skip(llama_context * ctx, const int32_t * layer_ids, int32_t n_layer_ids) {
+    if (ctx == nullptr) {
+        return;
+    }
+
+    std::vector<int32_t> ids;
+    if (layer_ids != nullptr && n_layer_ids > 0) {
+        ids.assign(layer_ids, layer_ids + n_layer_ids);
+    }
+
+    ctx->set_layer_skip(ids);
+}
+
+void llama_set_resident_layers(llama_context * ctx, const int32_t * layer_ids, int32_t n_layer_ids) {
+    if (ctx == nullptr) {
+        return;
+    }
+
+    std::vector<int32_t> ids;
+    if (layer_ids != nullptr && n_layer_ids > 0) {
+        ids.assign(layer_ids, layer_ids + n_layer_ids);
+    }
+
+    ctx->set_resident_layers(ids);
+}
+
+void llama_set_cluster_full_attn(llama_context * ctx, bool force) {
+    if (ctx == nullptr) {
+        return;
+    }
+    auto * cluster = dynamic_cast<llama_kv_cache_cluster *>(ctx->get_memory());
+    if (cluster != nullptr) {
+        cluster->set_force_full_attn(force);
+    }
+}
+
+void llama_set_intermediate_capture(llama_context * ctx, bool enable) {
+    if (ctx == nullptr) {
+        return;
+    }
+
+    ctx->set_intermediate_capture(enable);
+}
+
+int32_t llama_get_intermediate_output(llama_context * ctx, const char * name, int32_t il, float * data, int32_t max_rows) {
+    if (ctx == nullptr) {
+        return 0;
+    }
+
+    return ctx->get_intermediate_output(name, il, data, max_rows);
+}
+
+int32_t llama_context::get_intermediate_output(const char * name, int32_t il, float * data, int32_t max_rows) {
+    if (name == nullptr || data == nullptr || il < 0) {
+        return 0;
+    }
+
+    synchronize();
+
+    ggml_tensor * t;
+    if (strcmp(name, "attn_out") == 0) {
+        t = il < (int32_t) cap_attn.size() ? cap_attn[il] : nullptr;
+    } else if (strcmp(name, "ffn_out") == 0) {
+        t = il < (int32_t) cap_ffn.size() ? cap_ffn[il] : nullptr;
+    } else {
+        return 0;
+    }
+    if (t == nullptr) {
+        return 0; // layer was skipped during the capture decode, or not captured
+    }
+
+    const int64_t n_rows = t->ne[1];
+    const int64_t n_embd = t->ne[0];
+    const int32_t n_copy = (int32_t) std::min<int64_t>(n_rows, max_rows);
+
+    ggml_backend_t backend = ggml_backend_sched_get_tensor_backend(sched.get(), t);
+    if (backend == nullptr) {
+        return 0;
+    }
+
+    ggml_backend_tensor_get_async(backend, t, data, 0, n_copy*n_embd*sizeof(float));
+    ggml_backend_synchronize(backend);
+    return n_copy;
 }
 
 void llama_set_warmup(llama_context * ctx, bool warmup) {

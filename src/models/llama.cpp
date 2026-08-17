@@ -126,6 +126,11 @@ llama_model_llama::graph<embed>::graph(const llama_model & model, const llm_grap
     for (int il = 0; il < n_layer; ++il) {
         res->t_layer_inp[il] = inpL;
 
+        // self-speculative (ConfLayers) skip: bypass the layer entirely, residual passes through
+        if (n_layer_skip(il)) {
+            continue;
+        }
+
         ggml_tensor * inpSA = inpL;
 
         // norm

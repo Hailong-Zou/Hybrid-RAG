@@ -26,6 +26,8 @@
 #include "fit.h"
 #include "ggml.h"
 #include "llama.h"
+#include "llama-conflayer.h"
+#include "log.h"
 
 #ifdef _WIN32
 #    define WIN32_LEAN_AND_MEAN
@@ -336,6 +338,14 @@ struct cmd_params {
     std::vector<std::string>         cpu_mask;
     std::vector<bool>                cpu_strict;
     std::vector<int>                 poll;
+    std::vector<bool>                cluster_attn;
+    std::vector<int>                 cluster_k;
+    std::vector<int>                 max_resident_clusters;
+    std::vector<int>                 cluster_topk_tokens;
+    std::vector<int>                 layer_chunks;
+    std::vector<float>               skip_ratio;
+    std::vector<int>                 topk;
+    std::vector<int>                 max_tree_seq;
     std::vector<int>                 n_gpu_layers;
     std::vector<int>                 n_cpu_moe;
     std::vector<llama_split_mode>    split_mode;
@@ -359,6 +369,8 @@ struct cmd_params {
     bool                             verbose;
     bool                             progress;
     bool                             no_warmup;
+    bool                             conflayer;
+    bool                             cluster_sparse;
     output_formats                   output_format;
     output_formats                   output_format_stderr;
 };
@@ -381,6 +393,14 @@ static const cmd_params cmd_params_defaults = {
     /* cpu_mask             */ { "0x0" },
     /* cpu_strict           */ { false },
     /* poll                 */ { 50 },
+    /* cluster_attn         */ { false },
+    /* cluster_k            */ { 4 },
+    /* max_resident_clusters*/ { 6 },
+    /* cluster_topk_tokens  */ { 1024 },
+    /* layer_chunks         */ { 0 },
+    /* skip_ratio           */ { 0.6f },
+    /* topk                 */ { 5 },
+    /* max_tree_seq         */ { 32 },
     /* n_gpu_layers         */ { -1 },
     /* n_cpu_moe            */ { 0 },
     /* split_mode           */ { LLAMA_SPLIT_MODE_LAYER },
@@ -404,6 +424,8 @@ static const cmd_params cmd_params_defaults = {
     /* verbose              */ false,
     /* progress             */ false,
     /* no_warmup            */ false,
+    /* conflayer            */ false,
+    /* cluster_sparse       */ false,
     /* output_format        */ MARKDOWN,
     /* output_format_stderr */ NONE,
 };
@@ -447,6 +469,18 @@ static void print_usage(int /* argc */, char ** argv) {
     printf("  -d, --n-depth <n>                           (default: %s)\n", join(cmd_params_defaults.n_depth, ",").c_str());
     printf("  -b, --batch-size <n>                        (default: %s)\n", join(cmd_params_defaults.n_batch, ",").c_str());
     printf("  -ub, --ubatch-size <n>                      (default: %s)\n", join(cmd_params_defaults.n_ubatch, ",").c_str());
+    printf("  --cluster-attn, --no-cluster-attn           enable cluster-based sparse attention (default: %d)\n", cmd_params_defaults.cluster_attn.back());
+    printf("  --cluster-k <n>                             Top-K clusters to attend (default: %s)\n", join(cmd_params_defaults.cluster_k, ",").c_str());
+    printf("  --max-resident-clusters <n>                 max clusters kept in memory (default: %s)\n", join(cmd_params_defaults.max_resident_clusters, ",").c_str());
+    printf("  --cluster-topk-tokens <n>                   max tokens for sparse attn (default: %s)\n", join(cmd_params_defaults.cluster_topk_tokens, ",").c_str());
+    printf("  --layer-chunks <n>                          layers of weights loaded per step, 0=off (default: %s)\n", join(cmd_params_defaults.layer_chunks, ",").c_str());
+    printf("  --skip-ratio <f>                            with --conflayer: target fraction of skipped layers (default: %s)\n", join(cmd_params_defaults.skip_ratio, ",").c_str());
+    printf("  --topk <n>                                  with --conflayer: draft top-k candidates per step (default: %s)\n", join(cmd_params_defaults.topk, ",").c_str());
+    printf("  --max-tree-seq <n>                          with --conflayer: seq/output budget of the verification tree (default: %s)\n", join(cmd_params_defaults.max_tree_seq, ",").c_str());
+    printf("  --conflayer                                benchmark ConfLayers self-speculative decoding\n");
+    printf("                                             (draft+verify; pp row = prefill speed, tg row = generate speed)\n");
+    printf("  --cluster-sparse                           with --conflayer: real sparse cluster attention in the\n");
+    printf("                                             verify phase (top-k cluster K/V only)\n");
     printf("  -ctk, --cache-type-k <t>                    (default: %s)\n", join(transform_to_str(cmd_params_defaults.type_k, ggml_type_name), ",").c_str());
     printf("  -ctv, --cache-type-v <t>                    (default: %s)\n", join(transform_to_str(cmd_params_defaults.type_v, ggml_type_name), ",").c_str());
     printf("  -t, --threads <n>                           (default: %s)\n", join(cmd_params_defaults.n_threads, ",").c_str());
@@ -521,6 +555,8 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
     params.progress             = cmd_params_defaults.progress;
     params.no_warmup            = cmd_params_defaults.no_warmup;
     params.offline              = cmd_params_defaults.offline;
+    params.conflayer            = cmd_params_defaults.conflayer;
+    params.cluster_sparse       = cmd_params_defaults.cluster_sparse;
 
     if (const char * env = getenv("HF_TOKEN")) {
         params.hf_token = env;
@@ -611,6 +647,46 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                 }
                 auto p = parse_int_range(argv[i]);
                 params.n_ubatch.insert(params.n_ubatch.end(), p.begin(), p.end());
+            } else if (arg == "--cluster-attn") {
+                params.cluster_attn.push_back(true);
+            } else if (arg == "--no-cluster-attn") {
+                params.cluster_attn.push_back(false);
+            } else if (arg == "--cluster-k") {
+                if (++i >= argc) { invalid_param = true; break; }
+                auto p = parse_int_range(argv[i]);
+                params.cluster_k.insert(params.cluster_k.end(), p.begin(), p.end());
+            } else if (arg == "--max-resident-clusters") {
+                if (++i >= argc) { invalid_param = true; break; }
+                auto p = parse_int_range(argv[i]);
+                params.max_resident_clusters.insert(params.max_resident_clusters.end(), p.begin(), p.end());
+            } else if (arg == "--cluster-topk-tokens") {
+                if (++i >= argc) { invalid_param = true; break; }
+                auto p = parse_int_range(argv[i]);
+                params.cluster_topk_tokens.insert(params.cluster_topk_tokens.end(), p.begin(), p.end());
+            } else if (arg == "--layer-chunks") {
+                if (++i >= argc) { invalid_param = true; break; }
+                auto p = parse_int_range(argv[i]);
+                params.layer_chunks.insert(params.layer_chunks.end(), p.begin(), p.end());
+            } else if (arg == "--skip-ratio") {
+                if (++i >= argc) { invalid_param = true; break; }
+                for (auto sr : string_split<std::string>(argv[i], split_delim)) {
+                    params.skip_ratio.push_back(std::stof(sr));
+                }
+            } else if (arg == "--topk") {
+                if (++i >= argc) { invalid_param = true; break; }
+                for (auto tk : string_split<std::string>(argv[i], split_delim)) {
+                    params.topk.push_back(std::stoi(tk));
+                }
+            } else if (arg == "--max-tree-seq") {
+                if (++i >= argc) { invalid_param = true; break; }
+                for (auto mts : string_split<std::string>(argv[i], split_delim)) {
+                    params.max_tree_seq.push_back(std::stoi(mts));
+                }
+            } else if (arg == "--conflayer") {
+                params.conflayer = true;
+            } else if (arg == "--cluster-sparse") {
+                params.conflayer = true;
+                params.cluster_sparse = true;
             } else if (arg == "-ctk" || arg == "--cache-type-k") {
                 if (++i >= argc) {
                     invalid_param = true;
@@ -1078,6 +1154,30 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
     if (params.n_ubatch.empty()) {
         params.n_ubatch = cmd_params_defaults.n_ubatch;
     }
+    if (params.cluster_attn.empty()) {
+        params.cluster_attn = cmd_params_defaults.cluster_attn;
+    }
+    if (params.cluster_k.empty()) {
+        params.cluster_k = cmd_params_defaults.cluster_k;
+    }
+    if (params.max_resident_clusters.empty()) {
+        params.max_resident_clusters = cmd_params_defaults.max_resident_clusters;
+    }
+    if (params.cluster_topk_tokens.empty()) {
+        params.cluster_topk_tokens = cmd_params_defaults.cluster_topk_tokens;
+    }
+    if (params.layer_chunks.empty()) {
+        params.layer_chunks = cmd_params_defaults.layer_chunks;
+    }
+    if (params.skip_ratio.empty()) {
+        params.skip_ratio = cmd_params_defaults.skip_ratio;
+    }
+    if (params.topk.empty()) {
+        params.topk = cmd_params_defaults.topk;
+    }
+    if (params.max_tree_seq.empty()) {
+        params.max_tree_seq = cmd_params_defaults.max_tree_seq;
+    }
     if (params.type_k.empty()) {
         params.type_k = cmd_params_defaults.type_k;
     }
@@ -1161,6 +1261,14 @@ struct cmd_params_instance {
     std::string        cpu_mask;
     bool               cpu_strict;
     int                poll;
+    bool               cluster_attn;
+    int                cluster_k;
+    int                max_resident_clusters;
+    int                cluster_topk_tokens;
+    int                layer_chunks;
+    float              skip_ratio;
+    int                topk;
+    int                max_tree_seq;
     int                n_gpu_layers;
     int                n_cpu_moe;
     llama_split_mode   split_mode;
@@ -1175,6 +1283,8 @@ struct cmd_params_instance {
     bool               embeddings;
     bool               no_op_offload;
     bool               no_host;
+    bool               conflayer;
+    bool               cluster_sparse;
     size_t             fit_target;
     uint32_t           fit_min_ctx;
 
@@ -1191,6 +1301,10 @@ struct cmd_params_instance {
         mparams.use_mmap      = use_mmap;
         mparams.use_direct_io = use_direct_io;
         mparams.no_host       = no_host;
+
+        // With layer-chunk streaming, eager mmap prefetch would fault the
+        // whole model into DRAM and defeat the memory-saving behavior.
+        mparams.no_mmap_prefetch = layer_chunks > 0;
 
         if (n_cpu_moe <= 0) {
             if (tensor_buft_overrides.empty()) {
@@ -1255,6 +1369,12 @@ struct cmd_params_instance {
         cparams.op_offload      = !no_op_offload;
         cparams.swa_full        = false;
 
+        cparams.cluster_attn          = cluster_attn;
+        cparams.cluster_k             = cluster_k;
+        cparams.max_resident_clusters = max_resident_clusters;
+        cparams.cluster_topk_tokens   = cluster_topk_tokens;
+        cparams.layer_chunks          = layer_chunks;
+
         return cparams;
     }
 };
@@ -1281,6 +1401,14 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
     for (const auto & nopo : params.no_op_offload)
     for (const auto & nb : params.n_batch)
     for (const auto & nub : params.n_ubatch)
+    for (const auto & ca : params.cluster_attn)
+    for (const auto & ck : params.cluster_k)
+    for (const auto & mrc : params.max_resident_clusters)
+    for (const auto & ctt : params.cluster_topk_tokens)
+    for (const auto & lc : params.layer_chunks)
+    for (const auto & sr : params.skip_ratio)
+    for (const auto & tp : params.topk)
+    for (const auto & mts : params.max_tree_seq)
     for (const auto & tk : params.type_k)
     for (const auto & tv : params.type_v)
     for (const auto & nkvo : params.no_kv_offload)
@@ -1295,34 +1423,44 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 continue;
             }
             cmd_params_instance instance = {
-                /* .model        = */ m,
-                /* .n_prompt     = */ n_prompt,
-                /* .n_gen        = */ 0,
-                /* .n_depth      = */ nd,
-                /* .n_batch      = */ nb,
-                /* .n_ubatch     = */ nub,
-                /* .type_k       = */ tk,
-                /* .type_v       = */ tv,
-                /* .n_threads    = */ nt,
-                /* .cpu_mask     = */ cm,
-                /* .cpu_strict   = */ cs,
-                /* .poll         = */ pl,
-                /* .n_gpu_layers = */ nl,
-                /* .n_cpu_moe    = */ ncmoe,
-                /* .split_mode   = */ sm,
-                /* .main_gpu     = */ mg,
-                /* .no_kv_offload= */ nkvo,
-                /* .flash_attn   = */ fa,
-                /* .devices      = */ devs,
-                /* .tensor_split = */ ts,
+                /* .model                 = */ m,
+                /* .n_prompt              = */ n_prompt,
+                /* .n_gen                 = */ 0,
+                /* .n_depth               = */ nd,
+                /* .n_batch               = */ nb,
+                /* .n_ubatch              = */ nub,
+                /* .type_k                = */ tk,
+                /* .type_v                = */ tv,
+                /* .n_threads             = */ nt,
+                /* .cpu_mask              = */ cm,
+                /* .cpu_strict            = */ cs,
+                /* .poll                  = */ pl,
+                /* .cluster_attn          = */ ca,
+                /* .cluster_k             = */ ck,
+                /* .max_resident_clusters = */ mrc,
+                /* .cluster_topk_tokens   = */ ctt,
+                /* .layer_chunks          = */ lc,
+                /* .skip_ratio            = */ sr,
+                /* .topk                  = */ tp,
+                /* .max_tree_seq          = */ mts,
+                /* .n_gpu_layers          = */ nl,
+                /* .n_cpu_moe             = */ ncmoe,
+                /* .split_mode            = */ sm,
+                /* .main_gpu              = */ mg,
+                /* .no_kv_offload         = */ nkvo,
+                /* .flash_attn            = */ fa,
+                /* .devices               = */ devs,
+                /* .tensor_split          = */ ts,
                 /* .tensor_buft_overrides = */ ot,
-                /* .use_mmap     = */ mmp,
-                /* .use_direct_io= */ dio,
-                /* .embeddings   = */ embd,
-                /* .no_op_offload= */ nopo,
-                /* .no_host      = */ noh,
-                /* .fit_target   = */ fpt,
-                /* .fit_min_ctx  = */ fpc,
+                /* .use_mmap              = */ mmp,
+                /* .use_direct_io         = */ dio,
+                /* .embeddings            = */ embd,
+                /* .no_op_offload         = */ nopo,
+                /* .no_host               = */ noh,
+                /* .conflayer             = */ params.conflayer,
+                /* .cluster_sparse        = */ params.cluster_sparse,
+                /* .fit_target            = */ fpt,
+                /* .fit_min_ctx           = */ fpc,
             };
             instances.push_back(instance);
         }
@@ -1332,34 +1470,44 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 continue;
             }
             cmd_params_instance instance = {
-                /* .model        = */ m,
-                /* .n_prompt     = */ 0,
-                /* .n_gen        = */ n_gen,
-                /* .n_depth      = */ nd,
-                /* .n_batch      = */ nb,
-                /* .n_ubatch     = */ nub,
-                /* .type_k       = */ tk,
-                /* .type_v       = */ tv,
-                /* .n_threads    = */ nt,
-                /* .cpu_mask     = */ cm,
-                /* .cpu_strict   = */ cs,
-                /* .poll         = */ pl,
-                /* .n_gpu_layers = */ nl,
-                /* .n_cpu_moe    = */ ncmoe,
-                /* .split_mode   = */ sm,
-                /* .main_gpu     = */ mg,
-                /* .no_kv_offload= */ nkvo,
-                /* .flash_attn   = */ fa,
-                /* .devices      = */ devs,
-                /* .tensor_split = */ ts,
+                /* .model                 = */ m,
+                /* .n_prompt              = */ 0,
+                /* .n_gen                 = */ n_gen,
+                /* .n_depth               = */ nd,
+                /* .n_batch               = */ nb,
+                /* .n_ubatch              = */ nub,
+                /* .type_k                = */ tk,
+                /* .type_v                = */ tv,
+                /* .n_threads             = */ nt,
+                /* .cpu_mask              = */ cm,
+                /* .cpu_strict            = */ cs,
+                /* .poll                  = */ pl,
+                /* .cluster_attn          = */ ca,
+                /* .cluster_k             = */ ck,
+                /* .max_resident_clusters = */ mrc,
+                /* .cluster_topk_tokens   = */ ctt,
+                /* .layer_chunks          = */ lc,
+                /* .skip_ratio            = */ sr,
+                /* .topk                  = */ tp,
+                /* .max_tree_seq          = */ mts,
+                /* .n_gpu_layers          = */ nl,
+                /* .n_cpu_moe             = */ ncmoe,
+                /* .split_mode            = */ sm,
+                /* .main_gpu              = */ mg,
+                /* .no_kv_offload         = */ nkvo,
+                /* .flash_attn            = */ fa,
+                /* .devices               = */ devs,
+                /* .tensor_split          = */ ts,
                 /* .tensor_buft_overrides = */ ot,
-                /* .use_mmap     = */ mmp,
-                /* .use_direct_io= */ dio,
-                /* .embeddings   = */ embd,
-                /* .no_op_offload= */ nopo,
-                /* .no_host      = */ noh,
-                /* .fit_target   = */ fpt,
-                /* .fit_min_ctx  = */ fpc,
+                /* .use_mmap              = */ mmp,
+                /* .use_direct_io         = */ dio,
+                /* .embeddings            = */ embd,
+                /* .no_op_offload         = */ nopo,
+                /* .no_host               = */ noh,
+                /* .conflayer             = */ params.conflayer,
+                /* .cluster_sparse        = */ params.cluster_sparse,
+                /* .fit_target            = */ fpt,
+                /* .fit_min_ctx           = */ fpc,
             };
             instances.push_back(instance);
         }
@@ -1369,34 +1517,44 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 continue;
             }
             cmd_params_instance instance = {
-                /* .model        = */ m,
-                /* .n_prompt     = */ n_pg.first,
-                /* .n_gen        = */ n_pg.second,
-                /* .n_depth      = */ nd,
-                /* .n_batch      = */ nb,
-                /* .n_ubatch     = */ nub,
-                /* .type_k       = */ tk,
-                /* .type_v       = */ tv,
-                /* .n_threads    = */ nt,
-                /* .cpu_mask     = */ cm,
-                /* .cpu_strict   = */ cs,
-                /* .poll         = */ pl,
-                /* .n_gpu_layers = */ nl,
-                /* .n_cpu_moe    = */ ncmoe,
-                /* .split_mode   = */ sm,
-                /* .main_gpu     = */ mg,
-                /* .no_kv_offload= */ nkvo,
-                /* .flash_attn   = */ fa,
-                /* .devices      = */ devs,
-                /* .tensor_split = */ ts,
+                /* .model                 = */ m,
+                /* .n_prompt              = */ n_pg.first,
+                /* .n_gen                 = */ n_pg.second,
+                /* .n_depth               = */ nd,
+                /* .n_batch               = */ nb,
+                /* .n_ubatch              = */ nub,
+                /* .type_k                = */ tk,
+                /* .type_v                = */ tv,
+                /* .n_threads             = */ nt,
+                /* .cpu_mask              = */ cm,
+                /* .cpu_strict            = */ cs,
+                /* .poll                  = */ pl,
+                /* .cluster_attn          = */ ca,
+                /* .cluster_k             = */ ck,
+                /* .max_resident_clusters = */ mrc,
+                /* .cluster_topk_tokens   = */ ctt,
+                /* .layer_chunks          = */ lc,
+                /* .skip_ratio            = */ sr,
+                /* .topk                  = */ tp,
+                /* .max_tree_seq          = */ mts,
+                /* .n_gpu_layers          = */ nl,
+                /* .n_cpu_moe             = */ ncmoe,
+                /* .split_mode            = */ sm,
+                /* .main_gpu              = */ mg,
+                /* .no_kv_offload         = */ nkvo,
+                /* .flash_attn            = */ fa,
+                /* .devices               = */ devs,
+                /* .tensor_split          = */ ts,
                 /* .tensor_buft_overrides = */ ot,
-                /* .use_mmap     = */ mmp,
-                /* .use_direct_io= */ dio,
-                /* .embeddings   = */ embd,
-                /* .no_op_offload= */ nopo,
-                /* .no_host      = */ noh,
-                /* .fit_target   = */ fpt,
-                /* .fit_min_ctx  = */ fpc,
+                /* .use_mmap              = */ mmp,
+                /* .use_direct_io         = */ dio,
+                /* .embeddings            = */ embd,
+                /* .no_op_offload         = */ nopo,
+                /* .no_host               = */ noh,
+                /* .conflayer             = */ params.conflayer,
+                /* .cluster_sparse        = */ params.cluster_sparse,
+                /* .fit_target            = */ fpt,
+                /* .fit_min_ctx           = */ fpc,
             };
             instances.push_back(instance);
         }
@@ -1421,6 +1579,13 @@ struct test {
     std::string              cpu_mask;
     bool                     cpu_strict;
     int                      poll;
+    bool                     cluster_attn;
+    int                      cluster_k;
+    int                      max_resident_clusters;
+    int                      cluster_topk_tokens;
+    int                      layer_chunks;
+    float                    skip_ratio;
+    int                      topk;
     ggml_type                type_k;
     ggml_type                type_v;
     int                      n_gpu_layers;
@@ -1461,6 +1626,13 @@ struct test {
         cpu_mask       = inst.cpu_mask;
         cpu_strict     = inst.cpu_strict;
         poll           = inst.poll;
+        cluster_attn   = inst.cluster_attn;
+        cluster_k      = inst.cluster_k;
+        max_resident_clusters = inst.max_resident_clusters;
+        cluster_topk_tokens   = inst.cluster_topk_tokens;
+        layer_chunks   = inst.layer_chunks;
+        skip_ratio     = inst.skip_ratio;
+        topk           = inst.topk;
         type_k         = inst.type_k;
         type_v         = inst.type_v;
         n_gpu_layers   = inst.n_gpu_layers;
@@ -2288,6 +2460,117 @@ int llama_bench(int argc, char ** argv) {
                 return 1;
             }
             prev_inst = &inst;
+        }
+
+        // ConfLayers self-speculative decoding mode: no ordinary context is created.
+        // One full draft+verify generate() per rep. The prompt instance times the prefill
+        // phase; the generation instance reuses the decode phase timing from the same run.
+        if (params.conflayer) {
+            static std::vector<uint64_t> cf_decode_ns;  // per-rep decode ns from the pp run
+            static std::vector<float>    cf_accept_rate; // per-rep draft token acceptance rate
+            static std::vector<uint64_t> cf_draft_ns;   // per-rep draft-phase ns (skip-graph decodes)
+            static std::vector<uint64_t> cf_verify_ns;  // per-rep verify-phase ns (full-model tree decode)
+            static std::vector<uint64_t> cf_opt_ns;     // per-rep dynamic_optimization ns
+            static std::vector<uint64_t> cf_tree_nodes; // per-rep total verification tree nodes
+            static std::vector<uint64_t> cf_rounds;     // per-rep verification rounds
+            static std::vector<uint64_t> cf_draft_tok;  // per-rep draft tokens (skip-graph steps)
+            static bool                  cf_pp_ran = false;
+
+            test t(inst, lmodel, nullptr);
+
+            const llama_vocab * vocab = llama_model_get_vocab(lmodel);
+            const int32_t n_vocab = llama_vocab_n_tokens(vocab);
+            const int n_gen = params.n_gen.empty() ? 0 : params.n_gen[0];
+
+            llama_conflayer_params cf_params;
+            cf_params.n_ctx           = inst.n_ctx;
+            cf_params.n_batch         = inst.n_batch;
+            cf_params.n_ubatch        = inst.n_ubatch;
+            cf_params.max_new_tokens  = (uint32_t) n_gen;
+            cf_params.layer_chunks    = inst.layer_chunks;
+            cf_params.skip_ratio      = inst.skip_ratio;
+            cf_params.topk            = (uint32_t) inst.topk;
+            cf_params.max_seq         = (uint32_t) inst.max_tree_seq;
+            cf_params.cluster_attn    = inst.cluster_attn || params.cluster_sparse;
+            cf_params.cluster_sparse  = params.cluster_sparse;
+            // ConfLayers draft strategy: per-layer confidence, sliding window, search
+            // interval (the dynamic_optimization layer-set search, same as --optimize)
+            cf_params.optimize        = true;
+
+            // same random prompt scheme as test_prompt() so the prefill is comparable
+            std::vector<llama_token> tokens(inst.n_prompt);
+            for (int i = 0; i < inst.n_prompt; ++i) {
+                tokens[i] = i == 0 && llama_vocab_get_add_bos(vocab) ? llama_vocab_bos(vocab) : (llama_token) (std::rand() % n_vocab);
+            }
+
+            if (inst.n_prompt > 0 && !cf_pp_ran) {
+                if (!params.no_warmup) {
+                    llama_conflayer wc(lmodel, cf_params);
+                    std::vector<llama_token> wout;
+                    wc.generate(tokens, wout, nullptr);
+                }
+                for (int i = 0; i < params.reps; ++i) {
+                    llama_conflayer conf(lmodel, cf_params);
+                    std::vector<llama_token> out;
+                    llama_conflayer_metrics cm;
+                    if (!conf.generate(tokens, out, &cm)) {
+                        fprintf(stderr, "%s: conflayer generate failed\n", __func__);
+                        llama_model_free(lmodel);
+                        return 1;
+                    }
+                    t.samples_ns.push_back(cm.prefill_us * 1000); // us -> ns
+                    cf_decode_ns.push_back(cm.decode_us * 1000);
+                    cf_accept_rate.push_back(cm.accept_rate);
+                    cf_draft_ns.push_back(cm.draft_us * 1000);
+                    cf_verify_ns.push_back(cm.verify_us * 1000);
+                    cf_opt_ns.push_back(cm.opt_us * 1000);
+                    cf_tree_nodes.push_back(cm.n_tree_nodes);
+                    cf_rounds.push_back(cm.n_rounds);
+                    cf_draft_tok.push_back(cm.n_draft_tokens);
+                }
+                cf_pp_ran = true;
+            } else if (inst.n_prompt == 0 && cf_pp_ran) {
+                t.samples_ns = cf_decode_ns;
+                if (!cf_accept_rate.empty()) {
+                    float ar = 0.0f;
+                    for (float a : cf_accept_rate) {
+                        ar += a;
+                    }
+                    ar /= (float) cf_accept_rate.size();
+                    fprintf(stderr, "cf accept rate: %.3f (over %zu reps)\n", ar, cf_accept_rate.size());
+                }
+                if (!cf_decode_ns.empty()) {
+                    const auto avg = [](const std::vector<uint64_t> & v) {
+                        uint64_t s = 0;
+                        for (uint64_t x : v) s += x;
+                        return s / (uint64_t) v.size();
+                    };
+                    const double dt = cf_decode_ns[0] / 1e9, dd = avg(cf_draft_ns) / 1e9,
+                                 dv = avg(cf_verify_ns) / 1e9, do_ = avg(cf_opt_ns) / 1e9;
+                    fprintf(stderr, "cf phase split: draft %.2fs (%.0f%%)  verify %.2fs (%.0f%%)  opt %.2fs (%.0f%%)  other %.2fs\n",
+                            dd, 100.0 * dd / dt, dv, 100.0 * dv / dt, do_, 100.0 * do_ / dt, dt - dd - dv - do_);
+                    if (!cf_rounds.empty()) {
+                        fprintf(stderr, "cf tree: %.1f nodes/round, %.2f draft-steps/round over %llu rounds\n",
+                                (double) avg(cf_tree_nodes) / (double) avg(cf_rounds),
+                                (double) avg(cf_draft_tok) / (double) avg(cf_rounds),
+                                (unsigned long long) avg(cf_rounds));
+                    }
+                }
+            } else {
+                fprintf(stderr, "%s: conflayer mode requires a prompt run before the generation run\n", __func__);
+                llama_model_free(lmodel);
+                return 1;
+            }
+
+            if (p) {
+                p->print_test(t);
+                fflush(p->fout);
+            }
+            if (p_err) {
+                p_err->print_test(t);
+                fflush(p_err->fout);
+            }
+            continue;
         }
 
         llama_context * ctx = llama_init_from_model(lmodel, cparams);

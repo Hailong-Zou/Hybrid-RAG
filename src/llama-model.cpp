@@ -3537,6 +3537,14 @@ void llama_model::madvise_layer_weights(
         int il_start,
         int il_end,
         int advice) const {
+    madvise_layer_weights(il_start, il_end, advice, {});
+}
+
+void llama_model::madvise_layer_weights(
+        int il_start,
+        int il_end,
+        int advice,
+        const std::vector<bool> & layer_skip) const {
     size_t total_bytes = 0;
 
     int successes = 0;
@@ -3558,6 +3566,12 @@ void llama_model::madvise_layer_weights(
 
         const int layer = atoi(name.c_str() + blk_pos + 4);
         if (layer < il_start || layer >= il_end) {
+            continue;
+        }
+
+        // ConfLayer exclusion/protection mask:
+        // true means this layer must not be touched by this madvise operation.
+        if (layer < (int) layer_skip.size() && layer_skip[layer]) {
             continue;
         }
 

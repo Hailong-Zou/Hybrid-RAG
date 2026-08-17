@@ -51,6 +51,15 @@ struct llama_cparams {
 
     std::vector<bool> embeddings_layer_inp; // [n_layer()] extract input embeddings for layer
 
+    // [n_layer()] per-layer skip flag for self-speculative (ConfLayers) drafting:
+    //   a skipped layer is bypassed entirely (residual pass-through, no attention/FFN, no KV write)
+    std::vector<bool> layer_skip;
+
+    // [n_layer()] per-layer "never evict" mask for the layer-chunk weight offload: when set,
+    // only layers NOT in this mask stream from flash in chunks; these stay resident in RAM
+    // and are shared by every graph (ConfLayers draft + verify on one model instance).
+    std::vector<bool> resident_layers;
+
     enum llama_context_type ctx_type;
     enum llama_pooling_type pooling_type;
 
@@ -69,6 +78,7 @@ struct llama_cparams {
     int   cluster_max_prefetch = 4;      // max clusters to prefetch ahead
     bool  cluster_score_select = true;   // use score-based token selection (vs pure LRU)
 
-    // layer-by-layer weight offloading: 0=disabled, N=split into N chunks (must divide n_layer)
+    // layer-by-layer weight offloading: 0=disabled, N=layers loaded per step
+    // (skip-aware: a skip-graph draft only pins its non-skipped layers)
     int   layer_chunks = 0;
 };

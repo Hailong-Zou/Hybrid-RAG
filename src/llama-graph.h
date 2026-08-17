@@ -701,6 +701,17 @@ struct llm_graph_params {
     int il_start = 0;
     int il_end   = -1;
 
+    // per-layer skip flags for self-speculative drafting: [n_layer()], true = bypass the layer
+    //   (residual pass-through, no attention/FFN, no KV write). empty = no skipping
+    std::vector<bool> layer_skip;
+
+    // optional: raw pre-residual intermediate capture (ConfLayers validation). When non-null,
+    //   the graph callback stores the layer's raw attention/feed-forward output tensors in
+    //   these per-layer vectors, and set_outputs() marks them as graph outputs so they are
+    //   readable after the compute (via llama_get_intermediate_output).
+    std::vector<ggml_tensor *> * capture_attn = nullptr;
+    std::vector<ggml_tensor *> * capture_ffn  = nullptr;
+
     // optional: pre-computed hidden state from previous chunk (for pipeline)
     struct ggml_tensor * input_hidden_state = nullptr;
     // optional: output tensor to capture hidden state for next chunk
@@ -787,6 +798,15 @@ struct llm_graph_params {
 
         // TODO: https://github.com/ggml-org/llama.cpp/pull/24340#discussion_r3448035248
         if (cparams.nextn_layer_offset != other.cparams.nextn_layer_offset) {
+            return false;
+        }
+
+        if (layer_skip != other.layer_skip) {
+            return false;
+        }
+
+        // intermediate capture changes the set of marked graph outputs -> topology differs
+        if (capture_attn != other.capture_attn || capture_ffn != other.capture_ffn) {
             return false;
         }
 
@@ -959,6 +979,14 @@ struct llm_graph_context {
 
     int il_start_ = 0;
     int il_end_   = -1;
+
+    // per-layer skip flags for self-speculative drafting (see llm_graph_params::layer_skip)
+    std::vector<bool> layer_skip;
+
+    // true if layer il should be bypassed entirely (residual pass-through, no attention/FFN, no KV write)
+    bool n_layer_skip(int il) const {
+        return il >= 0 && il < (int) layer_skip.size() && layer_skip[il];
+    }
 
     llm_graph_context(const llm_graph_params & params);
     virtual ~llm_graph_context() = default;

@@ -683,6 +683,9 @@ struct llama_model {
     // advice = MADV_DONTNEED (release physical pages), MADV_WILLNEED (preload), MADV_SEQUENTIAL
     void madvise_all_weights(int advice) const;
     void madvise_layer_weights(int il_start, int il_end, int advice) const;
+    // Skip-aware variant: layers flagged true in layer_skip are never touched, so a
+    // skip-graph (ConfLayers draft) working set only pins the layers it actually computes.
+    void madvise_layer_weights(int il_start, int il_end, int advice, const std::vector<bool> & layer_skip) const;
 
     // Aggregated process-lifetime observability. Indexes are WILLNEED,
     // PAGEOUT, COLD, and other advice respectively.

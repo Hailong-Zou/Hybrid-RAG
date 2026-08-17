@@ -1269,6 +1269,20 @@ void llm_graph_result::set_outputs(const llm_graph_params & params) {
             ggml_set_output(t);
         }
     }
+    if (params.capture_attn) {
+        for (auto t : *params.capture_attn) {
+            if (t != nullptr) {
+                ggml_set_output(t);
+            }
+        }
+    }
+    if (params.capture_ffn) {
+        for (auto t : *params.capture_ffn) {
+            if (t != nullptr) {
+                ggml_set_output(t);
+            }
+        }
+    }
 }
 
 bool llm_graph_result::can_reuse(const llm_graph_params & params) {
@@ -1329,6 +1343,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     n_layer          (hparams.n_layer()),
     il_start_        (params.il_start),
     il_end_          (params.il_end),
+    layer_skip       (params.layer_skip),
     n_layer_nextn    (hparams.n_layer_nextn),
     n_rot            (hparams.n_rot()),
     n_ctx            (cparams.n_ctx),

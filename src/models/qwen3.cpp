@@ -72,6 +72,11 @@ llama_model_qwen3::graph::graph(const llama_model & model, const llm_graph_param
     for (int il = n_layer_start(); il < n_layer_end(); ++il) {
         res->t_layer_inp[il] = inpL;
 
+        // self-speculative (ConfLayers) skip: bypass the layer entirely, residual passes through
+        if (n_layer_skip(il)) {
+            continue;
+        }
+
         ggml_tensor * inpSA = inpL;
 
         // norm
@@ -111,6 +116,7 @@ llama_model_qwen3::graph::graph(const llama_model & model, const llm_graph_param
             cur = build_attn(inp_attn,
                     model.layers[il].wo, model.layers[il].wo_b, model.layers[il].wo_s,
                     Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, 1.0f/sqrtf(float(n_embd_head)), il);
+            cb(cur, "attn_out", il);
         }
         if (il == n_layer - 1 && inp_out_ids) {
             cur   = ggml_get_rows(ctx0,   cur, inp_out_ids);

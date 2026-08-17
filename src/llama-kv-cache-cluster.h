@@ -78,6 +78,13 @@ public:
                                               uint32_t current_cell_idx = UINT32_MAX);
     std::vector<uint32_t> select_positions_for_seq(llama_seq_id seq_id);
 
+    // When true, get_k/get_v always return the full KV view (sparse cluster attention
+    // disabled). Used by the ConfLayers module: its multi-seq tree verification needs
+    // the full KV, and its draft phase must not use clustered attention. Cluster
+    // bookkeeping (init/update/persist/evict) still runs.
+    void set_force_full_attn(bool f) { force_full_attn_ = f; }
+    bool force_full_attn() const { return force_full_attn_; }
+
     // ClusterView: unified view of cluster data (memory, disk, or buffer)
     ClusterView acquire_cluster_view(int32_t cluster_id, int32_t il);
     void release_cluster_view(ClusterView & view);
@@ -88,6 +95,7 @@ public:
 private:
     std::vector<std::unique_ptr<llama_kv_cluster_manager>> cluster_mgrs_;
     std::unique_ptr<llama_kv_pager> pager_;
+    bool force_full_attn_ = false;
     const llama_cparams & cparams_;
     bool prefill_done_ = false;
     size_t prefill_tok_count_ = 0;
