@@ -154,3 +154,6 @@ a.out.*
 AGENTS.local.md
 .pi/SYSTEM.md
 .claude/
+*.pdf
+*.png
+*.out

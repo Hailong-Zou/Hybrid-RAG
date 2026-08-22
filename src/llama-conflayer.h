@@ -38,6 +38,11 @@ struct llama_conflayer_params {
     uint32_t n_batch         = 512;    // logical max batch (must fit the verification tree)
     uint32_t n_ubatch        = 512;    // physical max batch (must fit the verification tree)
 
+    // CPU threads for the internal context. 0 = all cores (std::thread::hardware_concurrency).
+    // The context defaults to GGML_DEFAULT_N_THREADS (4) when this is left 0, which silently
+    // halves decode throughput versus a caller running the full model at -t 8.
+    int32_t  n_threads       = 0;
+
     uint32_t max_new_tokens  = 512;    // max new tokens to generate
     uint32_t max_step_draft  = 25;     // max draft steps per round
     uint32_t topk            = 5;      // top-k candidates kept per draft step
@@ -53,16 +58,34 @@ struct llama_conflayer_params {
 
     // dynamic_optimization layer-set search (Phase 5)
     float    skip_ratio      = 0.6f;   // target fraction of skipped layers
+    int32_t  max_skip_layers = 0;      // hard cap on skipped layers (0 = unlimited, current
+                                       // behavior). When set, only the N layers with the
+                                       // largest decision margin (most justified to skip) are
+                                       // skipped and the borderline ones are restored, which
+                                       // keeps the skip graph closest to the full model.
     bool     optimize        = false;  // enable the layer-set search
     uint32_t search_interval = 25;     // rounds between layer-set optimizations
     uint32_t context_window  = 32;     // validation window used by the search
     uint32_t max_opt_iter    = 1000;   // max optimization iterations
     float    max_score       = 0.95f;  // stop optimizing once the acceptance score reaches this
 
-    // flash-DRAM weight offloading (shared by draft and verify). With layer_chunks > 0 the
-    // draft's non-skipped layers form the resident set (always in RAM) and only the skip
-    // layers stream from flash in chunks. layer_chunks = layers streamed per step.
+    // false (default) = pure layer-skip decode: the skip graph decodes every token and its
+    // top-1 is emitted directly. true = legacy self-speculative decoding (draft + verify tree).
+    bool     verify          = false;
+    float    stop_agree      = 0.95f;  // pure-skip: freeze the skip set once full-model agreement reaches this
+    float    low_agree       = 0.6f;   // pure-skip: below this agreement, restore the best skip set
+
+    // flash-DRAM weight offloading. layer_chunks = number of rounds to stream the whole
+    // model in; each round owns a ceil(n_layer/layer_chunks)-wide window of layer indices
+    // and streams only its active (non-resident, non-skip) layers, so a window with 3 of 9
+    // layers skipped loads 6. 0 = disabled (full load to DRAM).
     int32_t  layer_chunks    = 0;      // 0 = disabled
+    // pure-skip resident mode: after prefill + the first layer-set optimization, pin the
+    // first keep_active_resident active (non-skip) layers in RAM and stream the rest (skip
+    // layers + remaining active layers) once per phase. 0 = off (current full-stream pageout,
+    // backward compatible); > 0 = first K active layers resident; negative or >= n_layer =
+    // all active layers resident (max speed). Ignored under verify (SD uses its own resident).
+    int32_t  keep_active_resident = 0;
     bool     cluster_attn    = false;  // enable cluster-based KV cache on the shared context
                                        // (cluster bookkeeping init/update/persist/evict always
                                        // runs; the attention mode is chosen below)
@@ -85,7 +108,8 @@ struct llama_conflayer_metrics {
     uint64_t n_tree_nodes   = 0;       // total verification tree nodes decoded by the full model
     uint64_t n_accepted     = 0;       // accepted draft tokens (excluding the verified root)
     uint64_t n_opt_rounds   = 0;       // dynamic_optimization rounds
-    float    accept_rate    = 0.0f;    // n_accepted / n_draft_tokens
+    float    accept_rate    = 0.0f;    // SD only: n_accepted / n_draft_tokens
+    float    agree_rate     = 0.0f;    // pure-skip: mean full-model agreement over optimizations
 
     uint64_t prefill_us     = 0;       // prefill phase wall time (microseconds)
     uint64_t decode_us      = 0;       // draft+verify generation loop wall time (microseconds)
@@ -94,6 +118,25 @@ struct llama_conflayer_metrics {
     uint64_t opt_us         = 0;       // dynamic_optimization wall time (validation + layer-set search)
 
     std::vector<uint32_t> accept_lengths; // accepted tokens per round (incl. the root)
+
+    // pure-skip skip-set statistics over the generated tokens (0 under verify).
+    uint64_t skip_count_sum = 0;       // summed skip-set size per generated token
+    uint32_t skip_count_min = 0;       // min skip-set size during generation
+    uint32_t skip_count_max = 0;       // max skip-set size during generation
+    // entropy skip threshold per layer-set update. find_skip_layers skips a layer when its
+    // z-scored confidence falls below a per-layer local threshold (lmu - lam_*lstd). Each
+    // entry here is that decision boundary converted to normalized entropy units (0..1,
+    // entropy / log(n_embd)); layers above the boundary get skipped. NOTE: confidence =
+    // 1 - entropy/max_entropy, so the code skips relatively HIGH-entropy (low-confidence)
+    // layers, the opposite of a "skip when confident" heuristic.
+    std::vector<float> opt_entropy_thresholds;
+
+    // per-layer confidence / entropy snapshot per layer-set optimization round.
+    // rows = optimization rounds, columns = layers 1..n_layer-2 (the skippable range).
+    // confidence = attn+ffn module confidence sum (0..2); entropy = normalized total
+    // entropy = 2 - confidence (0..2, higher = noisier / lower-confidence).
+    std::vector<std::vector<float>> opt_layer_confidence;
+    std::vector<std::vector<float>> opt_layer_entropy;
 };
 
 class llama_conflayer {
@@ -112,6 +155,30 @@ public:
     bool generate(const std::vector<llama_token> & prompt,
                   std::vector<llama_token>       & result,
                   llama_conflayer_metrics        * metrics = nullptr);
+
+    // Single-token answer eval for a benchmark prompt. One prefill serves both predictions:
+    //   baseline_answer = full-model argmax at the answer position (the root generate()
+    //                     would consume);
+    //   skip_answer     = skip-graph argmax at the answer position, produced by running the
+    //                     first layer-set optimization (same as generate()) and re-decoding
+    //                     the LAST prompt token through the skip graph.
+    // This measures the skip graph's own answer -- distinct from generate(), whose first
+    // emitted token is the continuation AFTER the full-model root. Returns false on failure.
+    //
+    // `letter_toks` (optional) is an array of n_letter candidate token ids (one per answer
+    // letter). When given, the answer-position logits of those candidates are copied into
+    // `baseline_logits_out` / `skip_logits_out` (each n_letter floats), captured within the
+    // same decode iteration so they are never invalidated. This supports the standard
+    // multiple-choice letter-scoring (argmax over the candidate logits) as an alternative
+    // to comparing the raw argmax token ids.
+    bool answer_token(const std::vector<llama_token> & prompt,
+                      int32_t                          n_letter,
+                      const int32_t                  * letter_toks,
+                      float                          * baseline_logits_out,
+                      float                          * skip_logits_out,
+                      llama_token                    & baseline_answer,
+                      llama_token                    & skip_answer,
+                      llama_conflayer_metrics        * metrics = nullptr);
 
     // Replaces the draft skip set. A skipped layer is bypassed entirely: residual
     // pass-through, no attention/FFN and no KV write. The draft graph is rebuilt on
@@ -171,14 +238,27 @@ private:
     // dynamic_optimization state (see conflayer/ConfLayers/evaluation/inference_conflayer.py)
     int32_t  opt_iter_      = 0;      // optimization iterations
     float    lam_           = 0.0f;   // adaptive window scale (statistics["lambda"])
-    float    best_score_    = 0.0f;   // best acceptance score found
-    float    best_acc_      = 0.0f;   // best mean accepted tokens
+    float    best_score_    = 0.0f;   // SD only: best acceptance score found
+    float    best_acc_      = 0.0f;   // SD only: best mean accepted tokens
+    float    best_agree_    = 0.0f;   // pure-skip: best full-model agreement seen
+    float    agree_sum_     = 0.0f;   // pure-skip: agreement accumulator (for agree_rate)
+    uint32_t agree_count_   = 0;      // pure-skip: agreement samples
     bool     optimization_on_ = false; // statistics["optimization"] is not None
     bool     do_opt_        = false;  // per-round trigger (local `optimization` in the Python)
     int32_t  skip_layer_num_ = 0;    // min skip set size to keep optimization active
     uint64_t n_opt_rounds_   = 0;    // dynamic_optimization rounds actually run
-    std::vector<float> origin_score_; // rolling per-round acceptance score
-    std::vector<uint32_t> origin_acc_; // rolling per-round accepted tokens
+    std::vector<float> origin_score_; // SD only: rolling per-round acceptance score
+    std::vector<uint32_t> origin_acc_; // SD only: rolling per-round accepted tokens
+
+    // pure-skip skip-set statistics (see llama_conflayer_metrics)
+    uint64_t skip_count_sum_ = 0;   // summed skip-set size per generated token
+    uint32_t skip_count_min_ = 0;   // min skip-set size during generation
+    uint32_t skip_count_max_ = 0;   // max skip-set size during generation
+    std::vector<float> opt_entropy_thresholds_; // entropy threshold per layer-set update
+    float    last_entropy_threshold_ = 0.0f;  // mean entropy threshold of the last search
+    // per-opt-round per-layer confidence / entropy snapshots (see llama_conflayer_metrics)
+    std::vector<std::vector<float>> opt_layer_confidence_;
+    std::vector<std::vector<float>> opt_layer_entropy_;
 
     // scratch buffers (avoid repeated allocations)
     std::vector<float>       softmax_scratch_;
@@ -192,6 +272,11 @@ private:
     // toggle the layer_skip graph of ctx_main_ between the draft phase (on) and the
     // full-model phases (off). No-op when the mode is already active.
     bool set_draft_mode(bool on);
+
+    // pure-skip resident mode: pin the first K active (non-skip) layers as the resident
+    // set (keep_active_resident). Called after each layer-set optimization so the resident
+    // mask tracks the current skip set. No-op when keep_active_resident <= 0 or verify.
+    void set_resident_active();
 
     // low-level decode helpers
     bool decode_seq(llama_context * ctx, const std::vector<llama_token> & tokens,
@@ -217,8 +302,10 @@ private:
     int index_in_sorted(const std::vector<std::vector<int32_t>> & sorted,
                         const std::vector<int32_t> & path) const;
 
-    // Phase 5: dynamic_optimization (layer-set search)
-    void dynamic_optimization(const std::vector<llama_token> & generated);
+    // Phase 5: dynamic_optimization (layer-set search). Runs the validation forward,
+    // computes the full-model agreement (pure-skip) and updates the skip set. Returns the
+    // agreement (0 when not applicable, e.g. the first iteration).
+    float dynamic_optimization(const std::vector<llama_token> & generated);
     float module_confidence(const char * name, int il, int n_tokens);
     std::vector<int32_t> find_skip_layers(const std::vector<float> & confidence);
 };

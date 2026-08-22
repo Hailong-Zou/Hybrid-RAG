@@ -10,11 +10,15 @@
 #include "llama.h"
 #include "llama-conflayer.h"
 
+#include "../../vendor/nlohmann/json.hpp"
+
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <fstream>
 #include <string>
+#include <thread>
 #include <vector>
 
 static void print_usage(const char * prog) {
@@ -27,7 +31,18 @@ static void print_usage(const char * prog) {
         "  -p, --prompt PROMPT      prompt (default: \"Hello my name is\")\n"
         "  -n, --n-predict N        max new tokens (default: 128)\n"
         "      --skip-ratio F       draft skip ratio (default: 0.6)\n"
+        "      --max-skip-layers N  hard cap on the number of skipped layers in pure-skip\n"
+        "                           (0 = unlimited, default). When set, only the N layers\n"
+        "                           with the largest decision margin (deepest local valleys)\n"
+        "                           are skipped; the borderline ones are restored, which\n"
+        "                           keeps the skip graph closest to the full model.\n"
+        "      --keep-active-resident K\n"
+        "                           pure-skip: keep the first K active (non-skip) layers resident\n"
+        "                           after prefill+opt and stream the rest; 0=off (default),\n"
+        "                           negative or >= n_layer = all active layers resident\n"
         "      --optimize           run the dynamic_optimization layer-set search\n"
+        "      --verify             legacy self-speculative decoding (draft + verify tree)\n"
+        "                           instead of pure layer-skip decode (default)\n"
         "      --topk N             draft top-k (default: 5)\n"
         "      --max-step-draft N   max draft steps per round (default: 25)\n"
         "      --max-tree-seq N     seq/output budget of the verification tree (default: 32)\n"
@@ -37,9 +52,9 @@ static void print_usage(const char * prog) {
         "      --max-opt-iter N     max optimization iterations (default: 1000)\n"
         "      --max-score F        stop optimizing at this acceptance score (default: 0.95)\n"
         "      --model-id ID        architecture id, used by dynamic_optimization (default: qwen3)\n"
-        "      --layer-chunks N     flash-DRAM offload: layers streamed per step; the draft's\n"
-        "                           non-skip layers stay resident (shared with verify), only the\n"
-        "                           skip layers stream from flash (0=off)\n"
+        "      --layer-chunks N     flash-DRAM offload: N rounds to load the whole model; each\n"
+        "                           round streams ceil(n_layer/N) layer indices, skipping layers\n"
+        "                           marked as skipped (0=off, full load to DRAM)\n"
         "      --cluster            enable cluster-based KV cache (bookkeeping runs; sparse\n"
         "                           cluster attention stays off, full KV view kept)\n"
         "      --cluster-sparse     cluster with REAL sparse attention in the verify phase\n"
@@ -49,7 +64,14 @@ static void print_usage(const char * prog) {
         "  -v, --verbose            verbose per-round output\n"
         "      --baseline           also run plain greedy decoding for comparison\n"
         "      --greedy-only        run only plain greedy decoding and exit\n"
-        "      --selftest           run the tree-vs-sequential logits selftest and exit\n",
+        "      --selftest           run the tree-vs-sequential logits selftest and exit\n"
+        "      --eval FILE          benchmark accuracy eval: JSONL of\n"
+        "                           {\"question\":..., \"choices\":[4], \"answer\":<0..3>}\n"
+        "                           one per line. Needs --optimize. Prints per-question\n"
+        "                           baseline vs skip-graph answer + the per-opt-round\n"
+        "                           layer confidence/entropy 2D table and an accuracy\n"
+        "                           summary. Model answers by a single letter A-D.\n"
+        "      --eval-limit N       stop after N eval questions (default: all)\n",
         prog);
 }
 
@@ -73,10 +95,12 @@ static void print_tokens(const llama_vocab * vocab, const std::vector<llama_toke
 static std::vector<llama_token> run_baseline(llama_model * model,
                                              const llama_vocab * vocab,
                                              const std::vector<llama_token> & prompt,
-                                             int n_predict) {
+                                             int n_predict, int32_t n_threads) {
     llama_context_params cparams = llama_context_default_params();
     cparams.n_ctx   = (uint32_t) (prompt.size() + n_predict + 32);
     cparams.n_batch = (uint32_t) prompt.size();
+    cparams.n_threads       = n_threads > 0 ? n_threads : (int32_t) std::thread::hardware_concurrency();
+    cparams.n_threads_batch = cparams.n_threads;
 
     llama_context * ctx = llama_init_from_model(model, cparams);
     if (ctx == NULL) {
@@ -122,6 +146,163 @@ static std::vector<llama_token> run_baseline(llama_model * model,
 
     llama_free(ctx);
     return out;
+}
+
+// Benchmark accuracy eval: baseline (full-model argmax) vs pure-skip (skip-graph argmax)
+// on single-token multiple-choice questions. Reads a JSONL file with one object per line:
+//   {"question": "...", "choices": ["...", "...", "...", "..."], "answer": 0}
+// answer = index of the correct choice. The model answers by emitting the single letter
+// of the chosen option, so the prompt is:
+//   {question}\n\nA. {choices[0]}\nB. {choices[1]}\nC. {choices[2]}\nD. {choices[3]}\n\nAnswer:
+// and the argmax token at the answer position is mapped back to A/B/C/D.
+static int run_eval(llama_model * model, const llama_vocab * vocab,
+                    const std::string & jsonl_path, const llama_conflayer_params & cparams,
+                    int32_t n_threads, int eval_limit) {
+    std::ifstream in(jsonl_path);
+    if (!in) {
+        fprintf(stderr, "eval: cannot open %s\n", jsonl_path.c_str());
+        return 1;
+    }
+
+    struct q {
+        std::string question;
+        std::vector<std::string> choices;
+        int answer = 0;
+    };
+    std::vector<q> questions;
+    std::string line;
+    while (std::getline(in, line)) {
+        if (line.empty() || line[0] != '{') {
+            continue;
+        }
+        try {
+            nlohmann::json j = nlohmann::json::parse(line);
+            q item;
+            item.question = j.value("question", std::string());
+            if (j.contains("choices")) {
+                for (const auto & c : j["choices"]) {
+                    item.choices.push_back(c.get<std::string>());
+                }
+            }
+            item.answer = j.value("answer", 0);
+            questions.push_back(std::move(item));
+        } catch (const std::exception & e) {
+            fprintf(stderr, "eval: bad line: %s\n", e.what());
+        }
+    }
+    if (questions.empty()) {
+        fprintf(stderr, "eval: no questions found in %s\n", jsonl_path.c_str());
+        return 1;
+    }
+    if (eval_limit > 0 && (int) questions.size() > eval_limit) {
+        questions.resize((size_t) eval_limit);
+    }
+    fprintf(stderr, "eval: %zu questions\n", questions.size());
+
+    // the prompt template + answer-letter tokens. Qwen tokenizers map " A" (space+letter)
+    // to a single token (362/425/356/422 for A/B/C/D here); find that token id for each
+    // letter. add_special=false: a BOS must not be prepended, or " A" reads as 2 tokens.
+    const char * letter_strs[4] = { " A", " B", " C", " D" };
+    llama_token letter_toks[4] = { -1, -1, -1, -1 };
+    for (int i = 0; i < 4; i++) {
+        llama_token t = 0;
+        const int n = llama_tokenize(vocab, letter_strs[i], strlen(letter_strs[i]),
+                                     &t, 1, false, false);
+        if (n == 1) {
+            letter_toks[i] = t;
+        }
+    }
+
+    llama_conflayer conf(model, cparams);
+
+    const char * letters = "ABCD";
+    int base_correct = 0, skip_correct = 0, both_wrong = 0, same_answer = 0;
+    int shown_tables = 0;
+
+    for (size_t qi = 0; qi < questions.size(); qi++) {
+        const q & item = questions[qi];
+
+        // build the MCQ prompt
+        std::string prompt = item.question + "\n\n";
+        for (int i = 0; i < 4 && (int) item.choices.size() > i; i++) {
+            prompt += std::string(1, letters[i]) + ". " + item.choices[i] + "\n";
+        }
+        prompt += "\nAnswer:";
+
+        std::vector<llama_token> ptok;
+        const int n = -llama_tokenize(vocab, prompt.c_str(), prompt.size(), NULL, 0, true, true);
+        ptok.resize(n);
+        if (llama_tokenize(vocab, prompt.c_str(), prompt.size(), ptok.data(), ptok.size(), true, true) < 0) {
+            fprintf(stderr, "eval: tokenize failed (q%zu)\n", qi);
+            return 1;
+        }
+
+        llama_token base_ans = -1, skip_ans = -1;
+        float base_logits[4] = { 0 }, skip_logits[4] = { 0 };
+        llama_conflayer_metrics metrics;
+        if (!conf.answer_token(ptok, 4, letter_toks, base_logits, skip_logits,
+                               base_ans, skip_ans, &metrics)) {
+            fprintf(stderr, "eval: answer_token failed (q%zu)\n", qi);
+            return 1;
+        }
+
+        // letter-scoring (standard MCQ eval): pick the letter with the highest candidate
+        // logit. Robust against the model emitting a continuation ("Option B", " B.") as
+        // the raw argmax instead of a bare letter token. A letter with no candidate token
+        // id (-1) can never be picked.
+        int base_idx = -1, skip_idx = -1;
+        float base_best = -1e30f, skip_best = -1e30f;
+        for (int i = 0; i < 4; i++) {
+            if (letter_toks[i] >= 0 && base_logits[i] > base_best) {
+                base_best = base_logits[i];
+                base_idx = i;
+            }
+            if (letter_toks[i] >= 0 && skip_logits[i] > skip_best) {
+                skip_best = skip_logits[i];
+                skip_idx = i;
+            }
+        }
+
+        const bool base_ok = base_idx == item.answer;
+        const bool skip_ok = skip_idx == item.answer;
+        base_correct += base_ok;
+        skip_correct += skip_ok;
+        if (!base_ok && !skip_ok) {
+            both_wrong++;
+        }
+        if (base_idx == skip_idx) {
+            same_answer++;
+        }
+
+        // print the 2D per-layer confidence / entropy table for the first few questions
+        if (shown_tables < 3 && !metrics.opt_layer_confidence.empty()) {
+            const auto & rc = metrics.opt_layer_confidence.front();
+            const auto & re = metrics.opt_layer_entropy.front();
+            fprintf(stderr, "\n  q%zu layer table (round 0): layer conf(ent)\n", qi);
+            for (size_t il = 1; il + 1 < rc.size(); il++) {
+                fprintf(stderr, "    L%3zu: %.3f (%.3f)\n", il, rc[il], re[il]);
+            }
+            shown_tables++;
+        }
+
+        const int nskip = (int) conf.get_skip_layers().size();
+        fprintf(stderr, "  q%zu [%s] base=%c skip=%c gold=%c  skip_layers=%d\n",
+                qi, (base_ok && skip_ok) ? "both" : (skip_ok ? "skip" : (base_ok ? "base" : "none")),
+                base_idx >= 0 ? letters[base_idx] : '?',
+                skip_idx >= 0 ? letters[skip_idx] : '?',
+                letters[item.answer], nskip);
+    }
+
+    const double n = (double) questions.size();
+    fprintf(stderr, "\n  === accuracy (%zu questions) ===\n", (size_t) n);
+    fprintf(stderr, "  baseline (full model) : %d / %zu = %.2f%%\n",
+            base_correct, (size_t) n, 100.0 * base_correct / n);
+    fprintf(stderr, "  pure-skip (skip graph): %d / %zu = %.2f%%\n",
+            skip_correct, (size_t) n, 100.0 * skip_correct / n);
+    fprintf(stderr, "  drop                  : %.2f pp\n", 100.0 * (base_correct - skip_correct) / n);
+    fprintf(stderr, "  same answer           : %d / %zu = %.2f%%\n",
+            same_answer, (size_t) n, 100.0 * same_answer / n);
+    return 0;
 }
 
 // Reproduce a single verification-tree round in isolation and compare the tree's
@@ -507,11 +688,14 @@ int main(int argc, char ** argv) {
     std::string prompt = "Hello my name is";
     std::string model_id = "qwen3";
     int n_predict = 128;
+    int32_t n_threads = 0; // 0 = all cores
     int ngl = 0;
     bool baseline = false;
     bool greedy_only = false;
     bool verbose = false;
     bool selftest = false;
+    std::string eval_path;
+    int eval_limit = 0;
 
     llama_conflayer_params cparams;
     cparams.optimize = false;
@@ -534,10 +718,18 @@ int main(int argc, char ** argv) {
             if (need_arg(argv[i])) prompt = argv[++i];
         } else if (strcmp(argv[i], "-n") == 0 || strcmp(argv[i], "--n-predict") == 0) {
             if (need_arg(argv[i])) n_predict = std::atoi(argv[++i]);
+        } else if (strcmp(argv[i], "-t") == 0 || strcmp(argv[i], "--threads") == 0) {
+            if (need_arg(argv[i])) n_threads = (int32_t) std::atoi(argv[++i]);
         } else if (strcmp(argv[i], "--skip-ratio") == 0) {
             if (need_arg(argv[i])) cparams.skip_ratio = (float) std::atof(argv[++i]);
+        } else if (strcmp(argv[i], "--max-skip-layers") == 0) {
+            if (need_arg(argv[i])) cparams.max_skip_layers = std::atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--keep-active-resident") == 0) {
+            if (need_arg(argv[i])) cparams.keep_active_resident = std::atoi(argv[++i]);
         } else if (strcmp(argv[i], "--optimize") == 0) {
             cparams.optimize = true;
+        } else if (strcmp(argv[i], "--verify") == 0) {
+            cparams.verify = true;
         } else if (strcmp(argv[i], "--topk") == 0) {
             if (need_arg(argv[i])) cparams.topk = (uint32_t) std::atoi(argv[++i]);
         } else if (strcmp(argv[i], "--max-step-draft") == 0) {
@@ -577,6 +769,10 @@ int main(int argc, char ** argv) {
             greedy_only = true;
         } else if (strcmp(argv[i], "--selftest") == 0) {
             selftest = true;
+        } else if (strcmp(argv[i], "--eval") == 0) {
+            if (need_arg(argv[i])) eval_path = argv[++i];
+        } else if (strcmp(argv[i], "--eval-limit") == 0) {
+            if (need_arg(argv[i])) eval_limit = std::atoi(argv[++i]);
         } else {
             fprintf(stderr, "unknown argument: %s\n", argv[i]);
             print_usage(argv[0]);
@@ -595,6 +791,7 @@ int main(int argc, char ** argv) {
 
     cparams.model_id = model_id;
     cparams.max_new_tokens = (uint32_t) n_predict;
+    cparams.n_threads = n_threads; // 0 = all cores
     if (verbose) {
         cparams.verbosity = 2; // --verbose upgrades the default, --verbosity wins
     }
@@ -604,6 +801,11 @@ int main(int argc, char ** argv) {
 
     llama_model_params mparams = llama_model_default_params();
     mparams.n_gpu_layers = ngl;
+    // with layer-chunks, weights stream from flash per chunk; the eager mmap prefetch at
+    // load (MAP_POPULATE + WILLNEED) would fault the whole model into RAM and defeat the
+    // chunk-offload, so skip it and let mmap demand-page the weights on access (same as
+    // llama-bench with --layer-chunks).
+    mparams.no_mmap_prefetch = (cparams.layer_chunks > 0);
 
     llama_model * model = llama_model_load_from_file(model_path.c_str(), mparams);
     if (model == NULL) {
@@ -615,6 +817,19 @@ int main(int argc, char ** argv) {
 
     if (selftest) {
         const int rc = run_selftest(model, vocab);
+        llama_model_free(model);
+        return rc;
+    }
+
+    if (!eval_path.empty()) {
+        // the eval compares the entropy-derived skip set, so the layer-set search must
+        // be on even if --optimize was not passed. answer_token() measures the pure-skip
+        // graph only, so the SD verify tree is never used here.
+        if (!cparams.optimize) {
+            cparams.optimize = true;
+        }
+        cparams.verify = false;
+        const int rc = run_eval(model, vocab, eval_path, cparams, n_threads, eval_limit);
         llama_model_free(model);
         return rc;
     }
@@ -634,7 +849,7 @@ int main(int argc, char ** argv) {
 
     if (greedy_only) {
         const auto g0 = ggml_time_us();
-        std::vector<llama_token> gres = run_baseline(model, vocab, prompt_tokens, n_predict);
+        std::vector<llama_token> gres = run_baseline(model, vocab, prompt_tokens, n_predict, n_threads);
         const double gdt = (ggml_time_us() - g0) / 1000.0;
         printf("baseline greedy (%d new tokens in %.1f ms):\n", (int) gres.size(), gdt);
         print_tokens(vocab, gres, false);
@@ -662,18 +877,28 @@ int main(int argc, char ** argv) {
 
     fprintf(stderr, "\n  rounds        : %llu\n", (unsigned long long) metrics.n_rounds);
     fprintf(stderr, "  draft tokens  : %llu\n", (unsigned long long) metrics.n_draft_tokens);
-    if (metrics.n_rounds > 0) {
-        fprintf(stderr, "  tree nodes    : %llu (%.1f nodes/round)\n", (unsigned long long) metrics.n_tree_nodes,
-                (double) metrics.n_tree_nodes / (double) metrics.n_rounds);
+    if (cparams.verify) {
+        if (metrics.n_rounds > 0) {
+            fprintf(stderr, "  tree nodes    : %llu (%.1f nodes/round)\n", (unsigned long long) metrics.n_tree_nodes,
+                    (double) metrics.n_tree_nodes / (double) metrics.n_rounds);
+        }
+        fprintf(stderr, "  accepted      : %llu (incl. root)\n", (unsigned long long) metrics.n_accepted + metrics.n_rounds);
+        fprintf(stderr, "  accept rate   : %.3f\n", metrics.accept_rate);
+    } else {
+        fprintf(stderr, "  agree rate    : %.3f (full-model agreement)\n", metrics.agree_rate);
     }
-    fprintf(stderr, "  accepted      : %llu (incl. root)\n", (unsigned long long) metrics.n_accepted + metrics.n_rounds);
-    fprintf(stderr, "  accept rate   : %.3f\n", metrics.accept_rate);
     fprintf(stderr, "  opt rounds    : %llu\n", (unsigned long long) metrics.n_opt_rounds);
     if (metrics.decode_us > 0) {
-        const double dd = metrics.draft_us / 1000.0, dv = metrics.verify_us / 1000.0, do_ = metrics.opt_us / 1000.0;
+        const double do_ = metrics.opt_us / 1000.0;
         const double dtot = metrics.decode_us / 1000.0;
-        fprintf(stderr, "  phase split   : draft %.1fms (%.0f%%)  verify %.1fms (%.0f%%)  opt %.1fms (%.0f%%)  other %.1fms\n",
-                dd, 100.0 * dd / dtot, dv, 100.0 * dv / dtot, do_, 100.0 * do_ / dtot, dtot - dd - dv - do_);
+        if (cparams.verify) {
+            const double dd = metrics.draft_us / 1000.0, dv = metrics.verify_us / 1000.0;
+            fprintf(stderr, "  phase split   : draft %.1fms (%.0f%%)  verify %.1fms (%.0f%%)  opt %.1fms (%.0f%%)  other %.1fms\n",
+                    dd, 100.0 * dd / dtot, dv, 100.0 * dv / dtot, do_, 100.0 * do_ / dtot, dtot - dd - dv - do_);
+        } else {
+            fprintf(stderr, "  phase split   : decode %.1fms (%.0f%%)  opt %.1fms (%.0f%%)\n",
+                    dtot - do_, 100.0 * (dtot - do_) / dtot, do_, 100.0 * do_ / dtot);
+        }
     }
     if (cparams.optimize) {
         const auto & sk = conf.get_skip_layers();
@@ -684,9 +909,46 @@ int main(int argc, char ** argv) {
         fprintf(stderr, "] (%zu layers)\n", sk.size());
     }
 
+    // 2D table: one row per layer-set optimization round (every `search_interval` tokens),
+    // one column per layer 1..n_layer-2: per-layer total confidence (0..2) and normalized
+    // entropy (0..2, = 2 - confidence). Higher confidence = lower entropy = more certain.
+    if (!metrics.opt_layer_confidence.empty() && metrics.opt_layer_confidence[0].size() > 3) {
+        const int n_cols = (int) metrics.opt_layer_confidence[0].size() - 2; // skippable layers
+        fprintf(stderr, "\n  layer confidence table (rows = opt rounds, cols = layers 1..%d)\n",
+                (int) metrics.opt_layer_confidence[0].size() - 2);
+        fprintf(stderr, "  round");
+        for (int c = 0; c < n_cols; c++) {
+            fprintf(stderr, "  L%-4d", c + 1);
+        }
+        fprintf(stderr, "\n");
+        for (size_t r = 0; r < metrics.opt_layer_confidence.size(); r++) {
+            const auto & rc = metrics.opt_layer_confidence[r];
+            fprintf(stderr, "  %3zu ", r);
+            for (int c = 0; c < n_cols; c++) {
+                fprintf(stderr, "  %.3f ", rc[c + 1]);
+            }
+            fprintf(stderr, "\n");
+        }
+        fprintf(stderr, "\n  layer entropy table (rows = opt rounds, cols = layers 1..%d)\n",
+                (int) metrics.opt_layer_entropy[0].size() - 2);
+        fprintf(stderr, "  round");
+        for (int c = 0; c < n_cols; c++) {
+            fprintf(stderr, "  L%-4d", c + 1);
+        }
+        fprintf(stderr, "\n");
+        for (size_t r = 0; r < metrics.opt_layer_entropy.size(); r++) {
+            const auto & re = metrics.opt_layer_entropy[r];
+            fprintf(stderr, "  %3zu ", r);
+            for (int c = 0; c < n_cols; c++) {
+                fprintf(stderr, "  %.3f ", re[c + 1]);
+            }
+            fprintf(stderr, "\n");
+        }
+    }
+
     if (baseline) {
         const auto b0 = ggml_time_us();
-        std::vector<llama_token> bres = run_baseline(model, vocab, prompt_tokens, n_predict);
+        std::vector<llama_token> bres = run_baseline(model, vocab, prompt_tokens, n_predict, n_threads);
         const double bdt = (ggml_time_us() - b0) / 1000.0;
         printf("\nbaseline greedy (%d new tokens in %.1f ms):\n", (int) bres.size(), bdt);
         print_tokens(vocab, bres, false);

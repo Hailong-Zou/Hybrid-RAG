@@ -2226,7 +2226,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_env("LLAMA_ARG_CLUSTER_SCORE_SELECT"));
     add_opt(common_arg(
         {"--layer-chunks"}, "N",
-        string_format("load N layers of weights per step (skip-aware for skip-graph drafts), 0=disabled (default: %d)", params.layer_chunks),
+        string_format("stream the whole model in N rounds (skip-aware: each round loads ceil(n_layer/N) layer indices minus its skipped layers), 0=disabled (default: %d)", params.layer_chunks),
         [](common_params & params, int value) {
             params.layer_chunks = value;
         }

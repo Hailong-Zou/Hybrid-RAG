@@ -28,6 +28,7 @@
 #include <cstdio>
 #include <map>
 #include <numeric>
+#include <thread>
 #include <utility>
 
 llama_conflayer::llama_conflayer(const llama_model * model, const llama_conflayer_params & params)
@@ -60,9 +61,11 @@ void llama_conflayer::set_skip_layers(const std::vector<int32_t> & skip_layers) 
         llama_set_layer_skip(ctx_main_, skip_layers_.data(), (int32_t) skip_layers_.size());
     }
 
-    // resident = complement of the skip set: the draft's compute layers stay in RAM and are
-    // shared with the verify phase; only the skipped layers stream from flash in chunks.
-    if (ctx_main_ && params_.layer_chunks > 0) {
+    // SD only: resident = complement of the skip set. The draft's compute layers stay in RAM
+    // and are shared with the verify phase; only the skipped layers stream from flash. The
+    // pure-skip path never sets a resident set: with only the layer_skip mask active the
+    // chunk offload streams the computed (non-skip) layers directly, keeping peak memory low.
+    if (ctx_main_ && params_.verify && params_.layer_chunks > 0) {
         std::vector<bool> skip_mask(n_layer_, false);
         for (int32_t il : skip_layers_) {
             if (il >= 0 && il < n_layer_) skip_mask[il] = true;
@@ -72,7 +75,11 @@ void llama_conflayer::set_skip_layers(const std::vector<int32_t> & skip_layers) 
         for (int il = 0; il < n_layer_; ++il) {
             if (!skip_mask[il]) resident.push_back(il);
         }
-        llama_set_resident_layers(ctx_main_, resident.data(), (int32_t) resident.size());
+        // prefault_stream=false: the skipped layers stream from flash per chunk and are never
+        // computed by the draft graph, so WILLNEED-ing them up front would only pin pages and
+        // raise peak (same reasoning as set_resident_active). The verify phase faults them on
+        // demand through the chunk offload.
+        llama_set_resident_layers_ex(ctx_main_, resident.data(), (int32_t) resident.size(), false);
     }
 }
 
@@ -95,11 +102,43 @@ bool llama_conflayer::set_draft_mode(bool on) {
     return true;
 }
 
+void llama_conflayer::set_resident_active() {
+    // pure-skip resident mode: pin the first K active (non-skip) layers and stream the rest.
+    // verify (SD) sets its own resident set in set_skip_layers, so keep_active_resident is
+    // ignored there. No-op when off, when the skip set is still empty, or when it would
+    // reduce to the legacy all-stream behavior (K == 0 after clamping).
+    if (params_.verify || skip_layers_.empty()) {
+        return;
+    }
+    const int K = params_.keep_active_resident < 0 || params_.keep_active_resident >= n_layer_
+                  ? n_layer_ : params_.keep_active_resident;
+    if (K <= 0) {
+        return;
+    }
+    std::vector<bool> skip_mask(n_layer_, false);
+    for (int32_t il : skip_layers_) {
+        if (il >= 0 && il < n_layer_) skip_mask[il] = true;
+    }
+    std::vector<int32_t> resident;
+    resident.reserve(K);
+    for (int il = 0; il < n_layer_ && (int) resident.size() < K; ++il) {
+        if (!skip_mask[il]) resident.push_back(il);
+    }
+    // prefault_stream=false: the stream set (skip layers + remaining active layers) is never
+    // computed by the skip graph, so WILLNEED-ing it would only pin pages and raise peak.
+    llama_set_resident_layers_ex(ctx_main_, resident.data(), (int32_t) resident.size(), false);
+}
+
 bool llama_conflayer::init_contexts() {
     llama_context_params cparams = llama_context_default_params();
     cparams.n_ctx         = params_.n_ctx;
     cparams.n_batch       = params_.n_batch;
     cparams.n_ubatch      = params_.n_ubatch;
+    // CPU threads: 0 = all cores. Without this the context silently runs the whole
+    // decode at GGML_DEFAULT_N_THREADS (4) instead of the caller's thread count.
+    cparams.n_threads       = params_.n_threads > 0 ? params_.n_threads
+                                                     : (int32_t) std::thread::hardware_concurrency();
+    cparams.n_threads_batch = cparams.n_threads;
     // the tree budget: the context's seq/output graph is sized to this (not LLAMA_MAX_SEQ),
     // so prefill only pays for the tree-sized reservation, not a 256-seq one.
     cparams.n_seq_max     = std::min(params_.max_seq, (uint32_t) LLAMA_CONFLAYER_MAX_SEQ);
@@ -691,13 +730,14 @@ std::vector<int32_t> llama_conflayer::find_skip_layers(const std::vector<float> 
     }
     const int n = (int) vals.size();
     if (n == 0) {
+        last_entropy_threshold_ = 0.0f;
         return {};
     }
 
     // z-score across layers
     std::vector<float> conf(n);
+    double mu = 0.0, sd = 1.0;
     {
-        double mu = 0.0;
         for (float c : vals) {
             mu += c;
         }
@@ -706,9 +746,9 @@ std::vector<int32_t> llama_conflayer::find_skip_layers(const std::vector<float> 
         for (float c : vals) {
             var += (c - mu) * (c - mu);
         }
-        const float sd = (float) std::sqrt(var / n);
+        sd = (float) std::sqrt(var / n);
         for (int i = 0; i < n; ++i) {
-            conf[i] = (vals[i] - (float) mu) / (sd + 1e-6f);
+            conf[i] = (vals[i] - (float) mu) / ((float) sd + 1e-6f);
         }
     }
 
@@ -766,6 +806,8 @@ std::vector<int32_t> llama_conflayer::find_skip_layers(const std::vector<float> 
     }
 
     std::vector<int32_t> skip;
+    std::vector<float>   skip_margin; // decision margin (threshold - conf) per candidate
+    double ent_thr_sum = 0.0;
     for (int i = 0; i < n; ++i) {
         const int window_scale = (int) (window_alpha * grad[i] * ((i + 1) / (float) num_layers));
         const int window_size  = 2 + window_scale;
@@ -783,54 +825,89 @@ std::vector<int32_t> llama_conflayer::find_skip_layers(const std::vector<float> 
             lmu += conf[j];
             ++cnt;
         }
+        float threshold;
         if (cnt == 0) {
-            if (conf[i] < 0.0f) {
-                skip.push_back(layer_ids[i]);
+            threshold = 0.0f;
+        } else {
+            lmu /= cnt;
+            double lvar = 0.0;
+            for (int j = start; j < end; ++j) {
+                if (j == i) {
+                    continue;
+                }
+                lvar += (conf[j] - lmu) * (conf[j] - lmu);
             }
-            continue;
+            const float lstd = (float) std::sqrt(lvar / cnt);
+            threshold = (float) lmu - lam_ * lstd;
         }
-        lmu /= cnt;
-        double lvar = 0.0;
-        for (int j = start; j < end; ++j) {
-            if (j == i) {
-                continue;
-            }
-            lvar += (conf[j] - lmu) * (conf[j] - lmu);
-        }
-        const float lstd = (float) std::sqrt(lvar / cnt);
-        const float threshold = (float) lmu - lam_ * lstd;
+        // confidence is the sum of the attn+ffn module confidences (each 1 - ent/max_ent),
+        // so normalized total entropy = 2 - confidence. The skip boundary confidence[i] <
+        // mu + sd*threshold therefore maps to total entropy > 2 - (mu + sd*threshold).
+        // Record the mean boundary as the entropy skip threshold of this update.
+        ent_thr_sum += 2.0 - (mu + sd * threshold);
         if (conf[i] < threshold) {
             skip.push_back(layer_ids[i]);
+            skip_margin.push_back(threshold - conf[i]);
         }
+    }
+    last_entropy_threshold_ = (float) (ent_thr_sum / n);
+
+    // hard cap on the skip set: keep only the N layers with the largest decision margin
+    // (the deepest local valleys, most justified to skip) and restore the borderline ones.
+    // This is the knob that trades speed for accuracy when the entropy profile alone would
+    // skip too many layers. When capped the lambda feedback loop is disabled, since the cap
+    // (not lambda) is now what controls the count.
+    bool capped = false;
+    if (params_.max_skip_layers > 0 && (int) skip.size() > params_.max_skip_layers) {
+        std::vector<size_t> idx(skip.size());
+        for (size_t k = 0; k < idx.size(); ++k) {
+            idx[k] = k;
+        }
+        std::sort(idx.begin(), idx.end(),
+                  [&](size_t a, size_t b) { return skip_margin[a] > skip_margin[b]; });
+        std::vector<int32_t> capped_skip;
+        capped_skip.reserve((size_t) params_.max_skip_layers);
+        for (int k = 0; k < params_.max_skip_layers; ++k) {
+            capped_skip.push_back(skip[idx[k]]);
+        }
+        skip.swap(capped_skip);
+        capped = true;
     }
 
     // lambda feedback loop
-    const float perc = (float) skip.size() / (float) (num_layers - 2);
-    if (perc > params_.skip_ratio + 0.25f) {
-        lam_ += 0.05f;
-    } else if (perc < params_.skip_ratio) {
-        lam_ -= 0.05f;
+    if (!capped) {
+        const float perc = (float) skip.size() / (float) (num_layers - 2);
+        if (perc > params_.skip_ratio + 0.25f) {
+            lam_ += 0.05f;
+        } else if (perc < params_.skip_ratio) {
+            lam_ -= 0.05f;
+        }
     }
     return skip;
 }
 
 // Phase 5: validation forward over the last `context_window` tokens, entropy confidence,
 // and layer-set update. Port of dynamic_optimization in conflayer utils.
-void llama_conflayer::dynamic_optimization(const std::vector<llama_token> & generated) {
+float llama_conflayer::dynamic_optimization(const std::vector<llama_token> & generated) {
     const int32_t window = (int32_t) std::min<uint32_t>(params_.context_window, (uint32_t) generated.size());
-    if (window <= 0) {
-        return;
+    if (window < 2) { // the agreement needs at least one emitted-token comparison
+        n_opt_rounds_++;
+        return 0.0f;
     }
     n_opt_rounds_++;
 
     // 1. validation forward on the last window tokens through the full model (capture on).
-    //    Re-decoding at already-cached positions recomputes identical cells, so the KV
-    //    cache of ctx_main_ is left unchanged. The full graph is required (skip off).
+    //    llama_decode rejects a batch that starts before the last cached position, so the
+    //    window has to be re-decoded from a truncation point: purge the cache from pos0
+    //    onward, then recompute those positions with the full model. After the forward the
+    //    window holds full-model KV (the accepted mixed-KV behavior); the skip-graph KV for
+    //    those positions is discarded. The full graph is required (skip off).
     if (!set_draft_mode(false)) {
-        return;
+        return 0.0f;
     }
     llama_set_intermediate_capture(ctx_main_, true);
     const llama_pos pos0 = n_past_ - window;
+    llama_memory_seq_rm(llama_get_memory(ctx_main_), 0, pos0, -1);
     llama_batch batch = llama_batch_init(window, 0, 1);
     batch.n_tokens = window;
     for (int32_t i = 0; i < window; ++i) {
@@ -838,32 +915,76 @@ void llama_conflayer::dynamic_optimization(const std::vector<llama_token> & gene
         batch.pos[i]       = pos0 + i;
         batch.n_seq_id[i]  = 1;
         batch.seq_id[i][0] = 0;
-        batch.logits[i]    = false;
+        batch.logits[i]    = true; // per-position argmax, needed for the agreement
     }
     const int rc = llama_decode(ctx_main_, batch);
     llama_batch_free(batch);
-    llama_set_intermediate_capture(ctx_main_, false);
     if (rc != 0) {
-        return;
+        llama_set_intermediate_capture(ctx_main_, false);
+        return 0.0f;
+    }
+    // note: capture stays ON until the captured outputs have been read below; turning it
+    // off earlier wipes cap_attn/cap_ffn and makes the intermediate reads return 0.
+
+    // 2. full-model agreement (pure-skip acceptance metric): row i predicts position
+    //    pos0+i+1, compare its argmax against the token the skip graph actually emitted
+    //    there. Skipped on the first iteration (generated is the prompt, which the skip
+    //    graph never produced, so there is nothing to compare).
+    float agree = 0.0f;
+    if (opt_iter_ > 0) {
+        int n_agree = 0;
+        for (int32_t i = 0; i + 1 < window; ++i) {
+            if (argmax(llama_get_logits_ith(ctx_main_, i)) == generated[generated.size() - (size_t) window + 1 + i]) {
+                n_agree++;
+            }
+        }
+        agree = (float) n_agree / (float) (window - 1);
+        agree_sum_ += agree;
+        agree_count_++;
     }
 
-    // 2. per-layer total confidence for layers 1..n_layer-2 (keep the first and last layer)
+    // 3. per-layer total confidence for layers 1..n_layer-2 (keep the first and last layer)
     std::vector<float> confidence(n_layer_, 0.0f);
+    std::vector<float> row_conf(n_layer_, 0.0f);
+    std::vector<float> row_ent(n_layer_, 0.0f);
     for (int il = 1; il < n_layer_ - 1; ++il) {
         confidence[il] = module_confidence("attn_out", il, window) + module_confidence("ffn_out", il, window);
+        // snapshot for the 2D table: total entropy (0..2) = 2 - total confidence (0..2)
+        row_conf[il] = confidence[il];
+        row_ent[il]  = 2.0f - confidence[il];
     }
-
-    // 3. find the new skip set and apply it. No KV re-decode is needed: the shared cache
-    //    already holds full-model KV for the whole history, and the next draft phase
-    //    reads it through the new skip graph.
+    opt_layer_confidence_.push_back(std::move(row_conf));
+    opt_layer_entropy_.push_back(std::move(row_ent));
     const std::vector<int32_t> new_skip = find_skip_layers(confidence);
-    set_skip_layers(new_skip);
+    // the entropy skip threshold of this layer-set search (decision boundary in
+    // normalized-entropy units; layers above it get skipped)
+    opt_entropy_thresholds_.push_back(last_entropy_threshold_);
+    // the captured outputs have been read; safe to turn capture off now
+    llama_set_intermediate_capture(ctx_main_, false);
+
+    // 4. decision, driven by the agreement (replaces the verify-derived acceptance path):
+    //      high agreement  -> the current skip set is faithful: freeze and keep it
+    //      low agreement   -> quality degraded: restore the best set found so far
+    //      otherwise       -> apply the entropy search result (normal adaptation)
+    if (opt_iter_ > 0 && agree > best_agree_) {
+        best_agree_ = agree;
+        opt_set_    = skip_layers_;
+    }
+    if (opt_iter_ > 0 && agree >= params_.stop_agree) {
+        optimization_on_ = false;
+    } else if (opt_iter_ > 0 && agree < params_.low_agree && !opt_set_.empty()) {
+        set_skip_layers(opt_set_);
+        lam_ = 0.0f;
+    } else {
+        set_skip_layers(new_skip);
+    }
 
     opt_iter_++;
     if (opt_iter_ >= (int32_t) params_.max_opt_iter) {
         set_skip_layers(opt_set_); // restore the best skip set found so far
         optimization_on_ = false;
     }
+    return agree;
 }
 
 bool llama_conflayer::generate(const std::vector<llama_token> & prompt,
@@ -881,6 +1002,9 @@ bool llama_conflayer::generate(const std::vector<llama_token> & prompt,
     lam_           = 0.0f;
     best_score_    = 0.0f;
     best_acc_      = 0.0f;
+    best_agree_    = 0.0f;
+    agree_sum_     = 0.0f;
+    agree_count_   = 0;
     optimization_on_ = params_.optimize;
     do_opt_        = true; // the Python local `optimization` starts true
     skip_layer_num_ = (int32_t) ((n_layer_ - 2) * params_.skip_ratio) + 1;
@@ -888,11 +1012,24 @@ bool llama_conflayer::generate(const std::vector<llama_token> & prompt,
     opt_set_.clear();
     origin_score_.clear();
     origin_acc_.clear();
+    skip_count_sum_ = 0;
+    skip_count_min_ = 0;
+    skip_count_max_ = 0;
+    opt_entropy_thresholds_.clear();
+    opt_layer_confidence_.clear();
+    opt_layer_entropy_.clear();
+    last_entropy_threshold_ = 0.0f;
+    // the prefill below must run through the full model: a previous generate()/answer_token()
+    // call may have left the skip graph active (draft_mode_ == true).
+    set_draft_mode(false);
 
     if (prompt.empty()) {
         return false;
     }
-    if (prompt.size() + params_.max_new_tokens + params_.max_step_draft + 2 > params_.n_ctx) {
+    // SD needs headroom for the draft+verify rounds; pure layer-skip decodes exactly
+    // max_new_tokens new positions, so it only needs prompt + max_new_tokens to fit.
+    const size_t sd_headroom = params_.verify ? params_.max_step_draft + 2 : 0;
+    if (prompt.size() + params_.max_new_tokens + sd_headroom > params_.n_ctx) {
         fprintf(stderr, "llama_conflayer: prompt + max_new_tokens exceeds n_ctx (%u)\n", params_.n_ctx);
         return false;
     }
@@ -920,114 +1057,294 @@ bool llama_conflayer::generate(const std::vector<llama_token> & prompt,
     llama_conflayer_metrics m;
     m.prefill_us = (uint64_t) (ggml_time_us() - t_prefill_0);
 
-    const int64_t t_decode_0 = ggml_time_us();
-    while (true) {
-        // Phase 2: greedy draft along the skip graph
-        draft_round d;
-        const int64_t t_draft_0 = ggml_time_us();
-        if (!draft(sample_token, d)) {
-            return false;
-        }
-        m.draft_us += (uint64_t) (ggml_time_us() - t_draft_0);
-        m.n_draft_tokens += d.top1_conf.size();
-        m.n_rounds += 1;
+    int64_t t_decode_0 = ggml_time_us();
+    if (params_.verify) {
+        // ---- legacy self-speculative decoding: draft + verify tree ----
+        while (true) {
+            // Phase 2: greedy draft along the skip graph
+            draft_round d;
+            const int64_t t_draft_0 = ggml_time_us();
+            if (!draft(sample_token, d)) {
+                return false;
+            }
+            // the draft chain was decoded on seq 0 beyond n_past_; drop those cells now.
+            // The verify tree re-decodes the same positions on the leaf seqs, so keeping
+            // them would leave two seq-0 cells per accepted position (duplicate KV cells
+            // that seq_rm(0, n_past_, -1) can never reach) and the cache fills up.
+            llama_memory_seq_rm(llama_get_memory(ctx_main_), 0, n_past_, -1);
+            m.draft_us += (uint64_t) (ggml_time_us() - t_draft_0);
+            m.n_draft_tokens += d.top1_conf.size();
+            m.n_rounds += 1;
 
-        // Phase 3: candidate tree + single-forward verification
-        std::vector<std::vector<int32_t>> choices;
-        get_choices(d, choices);
-        tree_buffers tree;
-        if (!build_tree(d, choices, tree)) {
-            return false;
-        }
-        m.n_tree_nodes += tree.n_nodes;
-        verify_result vr;
-        const int64_t t_verify_0 = ggml_time_us();
-        if (!verify_tree(tree, vr)) {
-            return false;
-        }
-        m.verify_us += (uint64_t) (ggml_time_us() - t_verify_0);
+            // Phase 3: candidate tree + single-forward verification
+            std::vector<std::vector<int32_t>> choices;
+            get_choices(d, choices);
+            tree_buffers tree;
+            if (!build_tree(d, choices, tree)) {
+                return false;
+            }
+            m.n_tree_nodes += tree.n_nodes;
+            verify_result vr;
+            const int64_t t_verify_0 = ggml_time_us();
+            if (!verify_tree(tree, vr)) {
+                return false;
+            }
+            m.verify_us += (uint64_t) (ggml_time_us() - t_verify_0);
 
-        // Phase 4: greedy acceptance + KV recycle
-        llama_token next_root;
-        std::vector<llama_token> accepted;
-        evaluate_posterior(tree, vr, next_root, accepted);
+            // Phase 4: greedy acceptance + KV recycle
+            llama_token next_root;
+            std::vector<llama_token> accepted;
+            evaluate_posterior(tree, vr, next_root, accepted);
 
-        m.n_accepted += accepted.size() - 1;
-        m.accept_lengths.push_back((uint32_t) accepted.size());
+            m.n_accepted += accepted.size() - 1;
+            m.accept_lengths.push_back((uint32_t) accepted.size());
 
-        if (!recycle(tree, vr.best_candidate, vr.accept_length)) {
-            return false;
-        }
-
-        result.insert(result.end(), accepted.begin(), accepted.end());
-        new_token_num_ += (int32_t) accepted.size();
-
-        // Phase 5: layer-set optimization (port of the statistics loop in swift_forward)
-        if (optimization_on_ && new_token_num_ > (int32_t) (params_.context_window + 1)) {
-            origin_score_.push_back((float) (accepted.size() - 1) / (float) std::max<size_t>(1, d.top1_conf.size()));
-            origin_acc_.push_back((uint32_t) (accepted.size() - 1));
-
-            if (opt_iter_ > 0 && origin_score_.size() == params_.search_interval / 2) {
-                if ((int) skip_layers_.size() >= skip_layer_num_) {
-                    const float acc = vec_mean(origin_acc_);
-                    if (acc < 1.0f) {
-                        origin_score_.clear();
-                        origin_acc_.clear();
-                        do_opt_ = true;
-                    }
-                }
+            if (!recycle(tree, vr.best_candidate, vr.accept_length)) {
+                return false;
             }
 
-            if (opt_iter_ > 0 && origin_score_.size() > params_.search_interval) {
-                if ((int) skip_layers_.size() >= skip_layer_num_) {
-                    const float ret = vec_mean(origin_score_);
-                    const float acc = vec_mean(origin_acc_);
-                    if (acc > 4.0f && ret > params_.max_score) {
-                        optimization_on_ = false; // statistics["optimization"] = None
-                        do_opt_ = false;
-                    } else if (acc > best_acc_) {
-                        best_acc_   = acc;
-                        best_score_ = ret;
-                        opt_set_    = skip_layers_;
-                        do_opt_     = true;
+            result.insert(result.end(), accepted.begin(), accepted.end());
+            new_token_num_ += (int32_t) accepted.size();
+
+            // Phase 5: layer-set optimization (port of the statistics loop in swift_forward)
+            if (optimization_on_ && new_token_num_ > (int32_t) (params_.context_window + 1)) {
+                origin_score_.push_back((float) (accepted.size() - 1) / (float) std::max<size_t>(1, d.top1_conf.size()));
+                origin_acc_.push_back((uint32_t) (accepted.size() - 1));
+
+                if (opt_iter_ > 0 && origin_score_.size() == params_.search_interval / 2) {
+                    if ((int) skip_layers_.size() >= skip_layer_num_) {
+                        const float acc = vec_mean(origin_acc_);
+                        if (acc < 1.0f) {
+                            origin_score_.clear();
+                            origin_acc_.clear();
+                            do_opt_ = true;
+                        }
+                    }
+                }
+
+                if (opt_iter_ > 0 && origin_score_.size() > params_.search_interval) {
+                    if ((int) skip_layers_.size() >= skip_layer_num_) {
+                        const float ret = vec_mean(origin_score_);
+                        const float acc = vec_mean(origin_acc_);
+                        if (acc > 4.0f && ret > params_.max_score) {
+                            optimization_on_ = false; // statistics["optimization"] = None
+                            do_opt_ = false;
+                        } else if (acc > best_acc_) {
+                            best_acc_   = acc;
+                            best_score_ = ret;
+                            opt_set_    = skip_layers_;
+                            do_opt_     = true;
+                        } else {
+                            do_opt_ = true;
+                        }
                     } else {
                         do_opt_ = true;
                     }
-                } else {
-                    do_opt_ = true;
+                    origin_score_.clear();
+                    origin_acc_.clear();
                 }
-                origin_score_.clear();
-                origin_acc_.clear();
+
+                if (do_opt_ || (int) skip_layers_.size() < skip_layer_num_) {
+                    const int64_t t_opt_0 = ggml_time_us();
+                    dynamic_optimization(result);
+                    m.opt_us += (uint64_t) (ggml_time_us() - t_opt_0);
+                    origin_score_.clear();
+                    origin_acc_.clear();
+                    do_opt_ = false;
+                }
             }
 
-            if (do_opt_ || (int) skip_layers_.size() < skip_layer_num_) {
+            // stop conditions
+            bool stop = false;
+            for (llama_token t : accepted) {
+                if (t == eos) {
+                    stop = true;
+                    break;
+                }
+            }
+            if (stop || new_token_num_ > (int32_t) params_.max_new_tokens) {
+                break;
+            }
+
+            sample_token = next_root;
+        }
+    } else {
+        // ---- pure layer-skip decoding: the skip graph decodes every token and its top-1
+        //      is emitted directly. No verify, no tree, no recycle. The skip set is updated
+        //      every `search_interval` tokens by dynamic_optimization, which measures the
+        //      full-model agreement over the recent window (see dynamic_optimization).
+        // first optimization right after prefill: establishes the initial skip set
+        // (entropy-only, no agreement yet) and avoids a cold full-model first interval
+        if (optimization_on_) {
+            const int64_t t_opt_0 = ggml_time_us();
+            dynamic_optimization(prompt);
+            m.opt_us += (uint64_t) (ggml_time_us() - t_opt_0);
+        }
+        set_draft_mode(true); // generation decodes through the skip graph
+        set_resident_active(); // pin the first K active layers (keep_active_resident)
+
+        uint32_t since_opt = 0;
+        while (true) {
+            if (!decode_seq(ctx_main_, { sample_token }, n_past_, true)) {
+                return false;
+            }
+            const float * logits = llama_get_logits_ith(ctx_main_, -1);
+            const llama_token tok = argmax(logits);
+            result.push_back(tok);
+            new_token_num_++;
+            n_past_++;
+            // per-token skip-set statistics (for the pure-skip skip count average + range)
+            const uint32_t ns = (uint32_t) skip_layers_.size();
+            skip_count_sum_ += ns;
+            skip_count_min_ = skip_count_min_ ? std::min(skip_count_min_, ns) : ns;
+            skip_count_max_ = std::max(skip_count_max_, ns);
+
+            since_opt++;
+            if (optimization_on_ && since_opt >= params_.search_interval) {
                 const int64_t t_opt_0 = ggml_time_us();
                 dynamic_optimization(result);
                 m.opt_us += (uint64_t) (ggml_time_us() - t_opt_0);
-                origin_score_.clear();
-                origin_acc_.clear();
-                do_opt_ = false;
+                since_opt = 0;
+                set_draft_mode(true); // back to the skip graph for generation
+                set_resident_active(); // opt may have changed the skip set -> resync resident
             }
-        }
 
-        // stop conditions
-        bool stop = false;
-        for (llama_token t : accepted) {
-            if (t == eos) {
-                stop = true;
+            bool stop = (tok == eos);
+            if (stop || new_token_num_ >= (int32_t) params_.max_new_tokens) {
                 break;
             }
+            sample_token = tok;
         }
-        if (stop || new_token_num_ > (int32_t) params_.max_new_tokens) {
-            break;
-        }
-
-        sample_token = next_root;
     }
 
-    m.accept_rate = m.n_draft_tokens ? (float) m.n_accepted / (float) m.n_draft_tokens : 0.0f;
+    if (params_.verify) {
+        m.accept_rate = m.n_draft_tokens ? (float) m.n_accepted / (float) m.n_draft_tokens : 0.0f;
+    } else {
+        m.n_rounds       = (uint64_t) new_token_num_;
+        m.n_draft_tokens = m.n_rounds; // every generated token is one skip-graph decode
+        m.agree_rate     = agree_count_ ? agree_sum_ / (float) agree_count_ : 0.0f;
+        m.skip_count_sum = skip_count_sum_;
+        m.skip_count_min = skip_count_min_;
+        m.skip_count_max = skip_count_max_;
+        m.opt_entropy_thresholds = std::move(opt_entropy_thresholds_);
+    }
     m.n_opt_rounds = n_opt_rounds_;
+    m.opt_layer_confidence = std::move(opt_layer_confidence_);
+    m.opt_layer_entropy    = std::move(opt_layer_entropy_);
     m.decode_us = (uint64_t) (ggml_time_us() - t_decode_0);
+    if (metrics) {
+        *metrics = m;
+    }
+    return true;
+}
+
+// Single-token answer eval. The full-model prefill + first layer-set optimization run
+// exactly as in generate(), then the LAST prompt token is re-decoded through the skip
+// graph so the returned token is the skip graph's own prediction at the answer position.
+bool llama_conflayer::answer_token(const std::vector<llama_token> & prompt,
+                                   int32_t                          n_letter,
+                                   const int32_t                  * letter_toks,
+                                   float                          * baseline_logits_out,
+                                   float                          * skip_logits_out,
+                                   llama_token                    & baseline_answer,
+                                   llama_token                    & skip_answer,
+                                   llama_conflayer_metrics        * metrics) {
+    if (!ctx_main_) {
+        return false;
+    }
+    n_past_ = 0;
+    new_token_num_ = 0;
+
+    // dynamic_optimization state (same reset as generate)
+    opt_iter_      = 0;
+    lam_           = 0.0f;
+    best_score_    = 0.0f;
+    best_acc_      = 0.0f;
+    best_agree_    = 0.0f;
+    agree_sum_     = 0.0f;
+    agree_count_   = 0;
+    optimization_on_ = params_.optimize;
+    do_opt_        = true;
+    skip_layer_num_ = (int32_t) ((n_layer_ - 2) * params_.skip_ratio) + 1;
+    n_opt_rounds_   = 0;
+    opt_set_.clear();
+    origin_score_.clear();
+    origin_acc_.clear();
+    skip_count_sum_ = 0;
+    skip_count_min_ = 0;
+    skip_count_max_ = 0;
+    opt_entropy_thresholds_.clear();
+    opt_layer_confidence_.clear();
+    opt_layer_entropy_.clear();
+    last_entropy_threshold_ = 0.0f;
+    // the prefill below must run through the full model: a previous generate()/answer_token()
+    // call may have left the skip graph active (draft_mode_ == true).
+    set_draft_mode(false);
+
+    if (prompt.empty()) {
+        return false;
+    }
+    if (prompt.size() > params_.n_ctx) {
+        fprintf(stderr, "llama_conflayer: prompt + answer exceeds n_ctx (%u)\n", params_.n_ctx);
+        return false;
+    }
+
+    // drop all seq-0 cells: answer_token is called once per benchmark question and a
+    // previous (possibly longer) prompt must not leave stale cells past the new prefill.
+    llama_memory_seq_rm(llama_get_memory(ctx_main_), 0, 0, -1);
+
+    // prefill the prompt through the full model (skip off)
+    const int chunk = (int) params_.n_batch;
+    for (size_t i0 = 0; i0 < prompt.size(); i0 += (size_t) chunk) {
+        const size_t n = std::min((size_t) chunk, prompt.size() - i0);
+        std::vector<llama_token> toks(prompt.begin() + i0, prompt.begin() + i0 + n);
+        const bool last = (i0 + n == prompt.size());
+        if (!decode_seq(ctx_main_, toks, (llama_pos) i0, last)) {
+            return false;
+        }
+    }
+    n_past_ = (int32_t) prompt.size();
+
+    // baseline: the full model's argmax at the answer position (the root generate() would
+    // consume). Read it before the first optimization, which re-decodes the window.
+    const float * lg = llama_get_logits_ith(ctx_main_, -1);
+    baseline_answer = argmax(lg);
+    if (letter_toks && baseline_logits_out) {
+        for (int32_t i = 0; i < n_letter; ++i) {
+            baseline_logits_out[i] = lg[letter_toks[i]];
+        }
+    }
+
+    // first optimization establishes the initial skip set from prompt entropy (same as
+    // generate()); then turn the skip graph on and re-decode the LAST prompt token through
+    // it -- its logits predict the answer position, so the argmax is the skip graph's own
+    // answer (not the full-model root that generate() consumes).
+    if (optimization_on_) {
+        dynamic_optimization(prompt);
+    }
+    set_draft_mode(true);
+    const llama_pos last_pos = n_past_ - 1;
+    llama_memory_seq_rm(llama_get_memory(ctx_main_), 0, last_pos, -1);
+    if (!decode_seq(ctx_main_, { prompt.back() }, last_pos, true)) {
+        return false;
+    }
+    lg = llama_get_logits_ith(ctx_main_, -1);
+    skip_answer = argmax(lg);
+    if (letter_toks && skip_logits_out) {
+        for (int32_t i = 0; i < n_letter; ++i) {
+            skip_logits_out[i] = lg[letter_toks[i]];
+        }
+    }
+
+    llama_conflayer_metrics m;
+    m.n_opt_rounds       = n_opt_rounds_;
+    m.agree_rate         = agree_count_ ? agree_sum_ / (float) agree_count_ : 0.0f;
+    m.skip_count_sum     = skip_layers_.size();
+    m.skip_count_min     = (uint32_t) skip_layers_.size();
+    m.skip_count_max     = (uint32_t) skip_layers_.size();
+    m.opt_entropy_thresholds = std::move(opt_entropy_thresholds_);
+    m.opt_layer_confidence = std::move(opt_layer_confidence_);
+    m.opt_layer_entropy    = std::move(opt_layer_entropy_);
     if (metrics) {
         *metrics = m;
     }

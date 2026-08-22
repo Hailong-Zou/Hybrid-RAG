@@ -402,7 +402,7 @@ extern "C" {
         bool  cluster_score_select;    // use score-based token selection
 
         // layer-by-layer weight offloading
-        int   layer_chunks;           // 0=disabled, N=layers loaded per step (skip-aware: a skip-graph only pins its non-skipped layers)
+        int   layer_chunks;           // 0=disabled, N=rounds to stream the whole model in (skip-aware: a round loads ceil(n_layer/N) layer indices minus its skipped layers)
 
         // [EXPERIMENTAL]
         // backend sampler chain configuration (make sure the caller keeps the sampler chains alive)
@@ -1029,6 +1029,7 @@ extern "C" {
     // stream from flash in chunks. Only meaningful when layer_chunks > 0. Pass
     // layer_ids == nullptr / n_layer_ids == 0 to clear. The graph is rebuilt on the next decode.
     LLAMA_API void llama_set_resident_layers(struct llama_context * ctx, const int32_t * layer_ids, int32_t n_layer_ids);
+    LLAMA_API void llama_set_resident_layers_ex(struct llama_context * ctx, const int32_t * layer_ids, int32_t n_layer_ids, bool prefault_stream);
 
     // Enable/disable capture of the raw pre-residual attention ("attn_out") and feed-forward
     // ("ffn_out") outputs of every layer during the next llama_decode() (ConfLayers validation).

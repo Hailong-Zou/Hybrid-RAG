@@ -344,6 +344,8 @@ struct cmd_params {
     std::vector<int>                 cluster_topk_tokens;
     std::vector<int>                 layer_chunks;
     std::vector<float>               skip_ratio;
+    std::vector<int>                 keep_active_resident;
+    std::vector<uint32_t>            search_interval;
     std::vector<int>                 topk;
     std::vector<int>                 max_tree_seq;
     std::vector<int>                 n_gpu_layers;
@@ -370,6 +372,7 @@ struct cmd_params {
     bool                             progress;
     bool                             no_warmup;
     bool                             conflayer;
+    bool                             verify;
     bool                             cluster_sparse;
     output_formats                   output_format;
     output_formats                   output_format_stderr;
@@ -399,6 +402,8 @@ static const cmd_params cmd_params_defaults = {
     /* cluster_topk_tokens  */ { 1024 },
     /* layer_chunks         */ { 0 },
     /* skip_ratio           */ { 0.6f },
+    /* keep_active_resident */ { 0 },
+    /* search_interval      */ { 25 },
     /* topk                 */ { 5 },
     /* max_tree_seq         */ { 32 },
     /* n_gpu_layers         */ { -1 },
@@ -425,6 +430,7 @@ static const cmd_params cmd_params_defaults = {
     /* progress             */ false,
     /* no_warmup            */ false,
     /* conflayer            */ false,
+    /* verify               */ false,
     /* cluster_sparse       */ false,
     /* output_format        */ MARKDOWN,
     /* output_format_stderr */ NONE,
@@ -473,12 +479,20 @@ static void print_usage(int /* argc */, char ** argv) {
     printf("  --cluster-k <n>                             Top-K clusters to attend (default: %s)\n", join(cmd_params_defaults.cluster_k, ",").c_str());
     printf("  --max-resident-clusters <n>                 max clusters kept in memory (default: %s)\n", join(cmd_params_defaults.max_resident_clusters, ",").c_str());
     printf("  --cluster-topk-tokens <n>                   max tokens for sparse attn (default: %s)\n", join(cmd_params_defaults.cluster_topk_tokens, ",").c_str());
-    printf("  --layer-chunks <n>                          layers of weights loaded per step, 0=off (default: %s)\n", join(cmd_params_defaults.layer_chunks, ",").c_str());
+    printf("  --layer-chunks <n>                          rounds to stream the whole model in, 0=off (default: %s)\n", join(cmd_params_defaults.layer_chunks, ",").c_str());
     printf("  --skip-ratio <f>                            with --conflayer: target fraction of skipped layers (default: %s)\n", join(cmd_params_defaults.skip_ratio, ",").c_str());
+    printf("  --keep-active-resident <k>                  with --conflayer: after prefill+opt, keep the first k\n");
+    printf("                                             active (non-skip) layers resident and stream the rest; 0=off\n");
+    printf("                                             (default), negative or >= n_layer = all active resident\n");
+    printf("  --search-interval <N>                       with --conflayer: rounds between layer-set optimizations (default: %s)\n", join(cmd_params_defaults.search_interval, ",").c_str());
     printf("  --topk <n>                                  with --conflayer: draft top-k candidates per step (default: %s)\n", join(cmd_params_defaults.topk, ",").c_str());
     printf("  --max-tree-seq <n>                          with --conflayer: seq/output budget of the verification tree (default: %s)\n", join(cmd_params_defaults.max_tree_seq, ",").c_str());
-    printf("  --conflayer                                benchmark ConfLayers self-speculative decoding\n");
-    printf("                                             (draft+verify; pp row = prefill speed, tg row = generate speed)\n");
+    printf("  --conflayer                                benchmark ConfLayers pure layer-skip decoding (default;\n");
+    printf("                                             the skip graph decodes every token directly, dynamic\n");
+    printf("                                             optimization picks the skip set; pp row = prefill speed,\n");
+    printf("                                             tg row = generate speed)\n");
+    printf("  --verify                                   with --conflayer: legacy self-speculative decoding\n");
+    printf("                                             (draft + verify tree) instead of pure layer-skip\n");
     printf("  --cluster-sparse                           with --conflayer: real sparse cluster attention in the\n");
     printf("                                             verify phase (top-k cluster K/V only)\n");
     printf("  -ctk, --cache-type-k <t>                    (default: %s)\n", join(transform_to_str(cmd_params_defaults.type_k, ggml_type_name), ",").c_str());
@@ -556,6 +570,7 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
     params.no_warmup            = cmd_params_defaults.no_warmup;
     params.offline              = cmd_params_defaults.offline;
     params.conflayer            = cmd_params_defaults.conflayer;
+    params.verify               = cmd_params_defaults.verify;
     params.cluster_sparse       = cmd_params_defaults.cluster_sparse;
 
     if (const char * env = getenv("HF_TOKEN")) {
@@ -672,6 +687,16 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                 for (auto sr : string_split<std::string>(argv[i], split_delim)) {
                     params.skip_ratio.push_back(std::stof(sr));
                 }
+            } else if (arg == "--keep-active-resident") {
+                if (++i >= argc) { invalid_param = true; break; }
+                for (auto k : string_split<std::string>(argv[i], split_delim)) {
+                    params.keep_active_resident.push_back(std::stoi(k));
+                }
+            } else if (arg == "--search-interval") {
+                if (++i >= argc) { invalid_param = true; break; }
+                for (auto s : string_split<std::string>(argv[i], split_delim)) {
+                    params.search_interval.push_back((uint32_t) std::stoul(s));
+                }
             } else if (arg == "--topk") {
                 if (++i >= argc) { invalid_param = true; break; }
                 for (auto tk : string_split<std::string>(argv[i], split_delim)) {
@@ -684,6 +709,9 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                 }
             } else if (arg == "--conflayer") {
                 params.conflayer = true;
+            } else if (arg == "--verify") {
+                params.conflayer = true;
+                params.verify = true;
             } else if (arg == "--cluster-sparse") {
                 params.conflayer = true;
                 params.cluster_sparse = true;
@@ -1172,6 +1200,12 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
     if (params.skip_ratio.empty()) {
         params.skip_ratio = cmd_params_defaults.skip_ratio;
     }
+    if (params.keep_active_resident.empty()) {
+        params.keep_active_resident = cmd_params_defaults.keep_active_resident;
+    }
+    if (params.search_interval.empty()) {
+        params.search_interval = cmd_params_defaults.search_interval;
+    }
     if (params.topk.empty()) {
         params.topk = cmd_params_defaults.topk;
     }
@@ -1253,6 +1287,7 @@ struct cmd_params_instance {
     int                n_prompt;
     int                n_gen;
     int                n_depth;
+    int                n_ctx;
     int                n_batch;
     int                n_ubatch;
     ggml_type          type_k;
@@ -1267,6 +1302,8 @@ struct cmd_params_instance {
     int                cluster_topk_tokens;
     int                layer_chunks;
     float              skip_ratio;
+    int                keep_active_resident;
+    uint32_t           search_interval;
     int                topk;
     int                max_tree_seq;
     int                n_gpu_layers;
@@ -1358,7 +1395,7 @@ struct cmd_params_instance {
     llama_context_params to_llama_cparams() const {
         llama_context_params cparams = llama_context_default_params();
 
-        cparams.n_ctx           = n_prompt + n_gen + n_depth;
+        cparams.n_ctx           = n_ctx > 0 ? n_ctx : (n_prompt + n_gen + n_depth);
         cparams.n_batch         = n_batch;
         cparams.n_ubatch        = n_ubatch;
         cparams.type_k          = type_k;
@@ -1407,6 +1444,8 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
     for (const auto & ctt : params.cluster_topk_tokens)
     for (const auto & lc : params.layer_chunks)
     for (const auto & sr : params.skip_ratio)
+    for (const auto & kar : params.keep_active_resident)
+    for (const auto & si : params.search_interval)
     for (const auto & tp : params.topk)
     for (const auto & mts : params.max_tree_seq)
     for (const auto & tk : params.type_k)
@@ -1417,6 +1456,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
     for (const auto & cm : params.cpu_mask)
     for (const auto & cs : params.cpu_strict)
     for (const auto & nd : params.n_depth)
+    for (const auto & nctx : params.n_ctx)
     for (const auto & pl : params.poll) {
         for (const auto & n_prompt : params.n_prompt) {
             if (n_prompt == 0) {
@@ -1427,6 +1467,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .n_prompt              = */ n_prompt,
                 /* .n_gen                 = */ 0,
                 /* .n_depth               = */ nd,
+                /* .n_ctx                 = */ nctx,
                 /* .n_batch               = */ nb,
                 /* .n_ubatch              = */ nub,
                 /* .type_k                = */ tk,
@@ -1441,6 +1482,8 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .cluster_topk_tokens   = */ ctt,
                 /* .layer_chunks          = */ lc,
                 /* .skip_ratio            = */ sr,
+                /* .keep_active_resident  = */ kar,
+                /* .search_interval       = */ si,
                 /* .topk                  = */ tp,
                 /* .max_tree_seq          = */ mts,
                 /* .n_gpu_layers          = */ nl,
@@ -1474,6 +1517,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .n_prompt              = */ 0,
                 /* .n_gen                 = */ n_gen,
                 /* .n_depth               = */ nd,
+                /* .n_ctx                 = */ nctx,
                 /* .n_batch               = */ nb,
                 /* .n_ubatch              = */ nub,
                 /* .type_k                = */ tk,
@@ -1488,6 +1532,8 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .cluster_topk_tokens   = */ ctt,
                 /* .layer_chunks          = */ lc,
                 /* .skip_ratio            = */ sr,
+                /* .keep_active_resident  = */ kar,
+                /* .search_interval       = */ si,
                 /* .topk                  = */ tp,
                 /* .max_tree_seq          = */ mts,
                 /* .n_gpu_layers          = */ nl,
@@ -1521,6 +1567,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .n_prompt              = */ n_pg.first,
                 /* .n_gen                 = */ n_pg.second,
                 /* .n_depth               = */ nd,
+                /* .n_ctx                 = */ nctx,
                 /* .n_batch               = */ nb,
                 /* .n_ubatch              = */ nub,
                 /* .type_k                = */ tk,
@@ -1535,6 +1582,8 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .cluster_topk_tokens   = */ ctt,
                 /* .layer_chunks          = */ lc,
                 /* .skip_ratio            = */ sr,
+                /* .keep_active_resident  = */ kar,
+                /* .search_interval       = */ si,
                 /* .topk                  = */ tp,
                 /* .max_tree_seq          = */ mts,
                 /* .n_gpu_layers          = */ nl,
@@ -2474,6 +2523,12 @@ int llama_bench(int argc, char ** argv) {
             static std::vector<uint64_t> cf_tree_nodes; // per-rep total verification tree nodes
             static std::vector<uint64_t> cf_rounds;     // per-rep verification rounds
             static std::vector<uint64_t> cf_draft_tok;  // per-rep draft tokens (skip-graph steps)
+            static std::vector<float>    cf_accept_avg; // per-rep avg accepted tokens per verify round (incl root)
+            static std::vector<float>    cf_agree_rate; // per-rep full-model agreement (pure layer-skip)
+            static std::vector<uint64_t> cf_skip_sum;   // per-rep summed skip-set size (pure layer-skip)
+            static std::vector<uint32_t> cf_skip_min;   // per-rep min skip-set size during generation
+            static std::vector<uint32_t> cf_skip_max;   // per-rep max skip-set size during generation
+            static std::vector<std::vector<float>> cf_ent_thr; // per-rep entropy skip threshold list
             static bool                  cf_pp_ran = false;
 
             test t(inst, lmodel, nullptr);
@@ -2483,19 +2538,27 @@ int llama_bench(int argc, char ** argv) {
             const int n_gen = params.n_gen.empty() ? 0 : params.n_gen[0];
 
             llama_conflayer_params cf_params;
-            cf_params.n_ctx           = inst.n_ctx;
+            // same fallback as to_llama_cparams(): n_ctx defaults to prompt+gen+depth
+            cf_params.n_ctx           = inst.n_ctx > 0 ? inst.n_ctx : (inst.n_prompt + n_gen + inst.n_depth);
             cf_params.n_batch         = inst.n_batch;
             cf_params.n_ubatch        = inst.n_ubatch;
+            // conflayer builds its own context; without forwarding the thread count it would
+            // run the whole decode at GGML_DEFAULT_N_THREADS (4) instead of -t <n>
+            cf_params.n_threads       = inst.n_threads;
             cf_params.max_new_tokens  = (uint32_t) n_gen;
             cf_params.layer_chunks    = inst.layer_chunks;
             cf_params.skip_ratio      = inst.skip_ratio;
+            cf_params.keep_active_resident = inst.keep_active_resident;
+            cf_params.search_interval = inst.search_interval;
             cf_params.topk            = (uint32_t) inst.topk;
             cf_params.max_seq         = (uint32_t) inst.max_tree_seq;
             cf_params.cluster_attn    = inst.cluster_attn || params.cluster_sparse;
             cf_params.cluster_sparse  = params.cluster_sparse;
-            // ConfLayers draft strategy: per-layer confidence, sliding window, search
-            // interval (the dynamic_optimization layer-set search, same as --optimize)
+            // ConfLayers skip strategy: per-layer confidence, sliding window, search
+            // interval (the dynamic_optimization layer-set search, same as --optimize).
+            // Default is pure layer-skip decode; --verify opts into legacy draft+verify SD.
             cf_params.optimize        = true;
+            cf_params.verify          = params.verify;
 
             // same random prompt scheme as test_prompt() so the prefill is comparable
             std::vector<llama_token> tokens(inst.n_prompt);
@@ -2527,17 +2590,54 @@ int llama_bench(int argc, char ** argv) {
                     cf_tree_nodes.push_back(cm.n_tree_nodes);
                     cf_rounds.push_back(cm.n_rounds);
                     cf_draft_tok.push_back(cm.n_draft_tokens);
+                    // average accepted tokens per verify round (incl the root): the
+                    // effective output-token count each tree forward contributes
+                    cf_accept_avg.push_back(cm.n_rounds
+                            ? (float) (cm.n_accepted + cm.n_rounds) / (float) cm.n_rounds
+                            : 0.0f);
+                    cf_agree_rate.push_back(cm.agree_rate);
+                    cf_skip_sum.push_back(cm.skip_count_sum);
+                    cf_skip_min.push_back(cm.skip_count_min);
+                    cf_skip_max.push_back(cm.skip_count_max);
+                    cf_ent_thr.push_back(cm.opt_entropy_thresholds);
                 }
                 cf_pp_ran = true;
             } else if (inst.n_prompt == 0 && cf_pp_ran) {
                 t.samples_ns = cf_decode_ns;
-                if (!cf_accept_rate.empty()) {
-                    float ar = 0.0f;
-                    for (float a : cf_accept_rate) {
-                        ar += a;
+                const auto avgf = [](const std::vector<float> & v) {
+                    float s = 0.0f;
+                    for (float x : v) s += x;
+                    return v.empty() ? 0.0f : s / (float) v.size();
+                };
+                if (params.verify) {
+                    if (!cf_accept_rate.empty()) {
+                        fprintf(stderr, "cf accept: rate %.3f, avg %.3f tokens/round (incl root, over %zu reps)\n",
+                                avgf(cf_accept_rate), avgf(cf_accept_avg), cf_accept_rate.size());
                     }
-                    ar /= (float) cf_accept_rate.size();
-                    fprintf(stderr, "cf accept rate: %.3f (over %zu reps)\n", ar, cf_accept_rate.size());
+                } else if (!cf_agree_rate.empty()) {
+                    fprintf(stderr, "cf agree: rate %.3f (full-model agreement over %zu reps)\n",
+                            avgf(cf_agree_rate), cf_agree_rate.size());
+                    // per-rep skip-set statistics + entropy threshold list (pure layer-skip).
+                    // avg skip count = summed skip-set size / generated tokens, averaged over reps.
+                    double sum = 0.0;
+                    uint64_t min_ = 0, max_ = 0;
+                    for (size_t i = 0; i < cf_skip_sum.size(); ++i) {
+                        sum += (double) cf_skip_sum[i];
+                        min_ = (i == 0) ? cf_skip_min[i] : std::min(min_, (uint64_t) cf_skip_min[i]);
+                        max_ = (i == 0) ? cf_skip_max[i] : std::max(max_, (uint64_t) cf_skip_max[i]);
+                    }
+                    const double n_gen = cf_decode_ns.empty() ? 1.0 : (double) (cf_decode_ns.size() ? inst.n_gen : 1);
+                    fprintf(stderr, "cf skip: avg %.2f layers/token (min %llu, max %llu) over %zu reps, %zu opt rounds\n",
+                            cf_skip_sum.empty() ? 0.0 : sum / (double) cf_skip_sum.size() / n_gen,
+                            (unsigned long long) min_, (unsigned long long) max_,
+                            cf_skip_sum.size(), cf_ent_thr.empty() ? 0 : cf_ent_thr[0].size());
+                    if (!cf_ent_thr.empty() && !cf_ent_thr[0].empty()) {
+                        fprintf(stderr, "cf ent-thr (rep 0):");
+                        for (float t : cf_ent_thr[0]) {
+                            fprintf(stderr, " %.3f", t);
+                        }
+                        fprintf(stderr, "\n");
+                    }
                 }
                 if (!cf_decode_ns.empty()) {
                     const auto avg = [](const std::vector<uint64_t> & v) {
@@ -2545,11 +2645,16 @@ int llama_bench(int argc, char ** argv) {
                         for (uint64_t x : v) s += x;
                         return s / (uint64_t) v.size();
                     };
-                    const double dt = cf_decode_ns[0] / 1e9, dd = avg(cf_draft_ns) / 1e9,
-                                 dv = avg(cf_verify_ns) / 1e9, do_ = avg(cf_opt_ns) / 1e9;
-                    fprintf(stderr, "cf phase split: draft %.2fs (%.0f%%)  verify %.2fs (%.0f%%)  opt %.2fs (%.0f%%)  other %.2fs\n",
-                            dd, 100.0 * dd / dt, dv, 100.0 * dv / dt, do_, 100.0 * do_ / dt, dt - dd - dv - do_);
-                    if (!cf_rounds.empty()) {
+                    const double dt = cf_decode_ns[0] / 1e9, do_ = avg(cf_opt_ns) / 1e9;
+                    if (params.verify) {
+                        const double dd = avg(cf_draft_ns) / 1e9, dv = avg(cf_verify_ns) / 1e9;
+                        fprintf(stderr, "cf phase split: draft %.2fs (%.0f%%)  verify %.2fs (%.0f%%)  opt %.2fs (%.0f%%)  other %.2fs\n",
+                                dd, 100.0 * dd / dt, dv, 100.0 * dv / dt, do_, 100.0 * do_ / dt, dt - dd - dv - do_);
+                    } else {
+                        fprintf(stderr, "cf phase split: decode %.2fs (%.0f%%)  opt %.2fs (%.0f%%)\n",
+                                dt - do_, 100.0 * (dt - do_) / dt, do_, 100.0 * do_ / dt);
+                    }
+                    if (params.verify && !cf_rounds.empty()) {
                         fprintf(stderr, "cf tree: %.1f nodes/round, %.2f draft-steps/round over %llu rounds\n",
                                 (double) avg(cf_tree_nodes) / (double) avg(cf_rounds),
                                 (double) avg(cf_draft_tok) / (double) avg(cf_rounds),

@@ -120,7 +120,7 @@ struct llama_context {
     void set_nextn_layer_offset(int32_t offset);
     void set_causal_attn(bool value);
     void set_layer_skip(const std::vector<int32_t> & skip_layers);
-    void set_resident_layers(const std::vector<int32_t> & resident_layers);
+    void set_resident_layers(const std::vector<int32_t> & resident_layers, bool prefault_stream = true);
     void set_intermediate_capture(bool value);
     int32_t get_intermediate_output(const char * name, int32_t il, float * data, int32_t max_rows);
     void set_warmup(bool value);
