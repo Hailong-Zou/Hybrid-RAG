@@ -2574,8 +2574,12 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
         // After forward pass: evict the stream set again so that between
         // ubatches the model footprint is minimized (resident layers stay).
+        // Skipped on the 1-token decode path: the next token's pre-decode evict
+        // re-runs the same full pass, so the post-decode pass is pure overhead
+        // (a full-weight PTE walk per token). Kept for multi-token ubatches
+        // (prefill), where it bounds the footprint between ubatches.
         // MADV_COLD keeps pages resident; skip the pass there (see pre-decode).
-        if (n_rounds > 0 && !active.empty() && llama_layer_chunk_evict_advice() != MADV_COLD) {
+        if (n_rounds > 0 && !active.empty() && ubatch.n_tokens > 1 && llama_layer_chunk_evict_advice() != MADV_COLD) {
             if (!has_resident) {
                 model.madvise_all_weights(llama_layer_chunk_evict_advice());
             } else {
