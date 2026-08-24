@@ -1586,6 +1586,7 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     // with layer-chunks, weights stream from flash per chunk; eager mmap prefetch at
     // load would defeat the memory saving, so skip it when chunking is enabled
     mparams.no_mmap_prefetch            = params.layer_chunks > 0;
+    mparams.layer_chunks                 = params.layer_chunks;
 
     return mparams;
 }

@@ -329,6 +329,9 @@ extern "C" {
         bool no_host;         // bypass host buffer allowing extra buffers to be used
         bool no_alloc;        // only load metadata and simulate memory allocations
         bool no_mmap_prefetch;// skip eager mmap prefetch (MAP_POPULATE+WILLNEED) at load
+
+        // [EXPERIMENTAL] logical transformer-layer chunks for model-weight residency
+        int32_t layer_chunks; // 0=disabled, N=chunks (must divide n_layer)
     };
 
     struct llama_sampler_seq_config {

@@ -22,6 +22,7 @@ enum htp_data_type {
     HTP_TYPE_Q4_0   = 2,
     HTP_TYPE_Q4_1   = 3,
     HTP_TYPE_Q8_0   = 8,
+    HTP_TYPE_Q6_K   = 14,
     HTP_TYPE_IQ4_NL = 20,
     HTP_TYPE_I32    = 26,
     HTP_TYPE_I64    = 27,
@@ -31,6 +32,7 @@ enum htp_data_type {
     HTP_TYPE_Q4_0_TILED = 200,
     HTP_TYPE_Q4_1_TILED,
     HTP_TYPE_Q8_0_TILED,
+    HTP_TYPE_Q6_K_TILED,
     HTP_TYPE_MXFP4_TILED,
 
     HTP_TYPE_INVALID
@@ -39,6 +41,7 @@ enum htp_data_type {
 // Constats for internal types
 #define QK_Q4_0_TILED  256  // 32x32 Q4_0 tiled layout
 #define QK_Q8_0_TILED  128  // 32x32 Q8_0 tiled layout
+#define QK_Q6_K_TILED  1024 // 32x32 Q6_K tiled layout (logical elements)
 #define QK_MXFP4_TILED 256  // 32x32 MXFP4 tiled layout
 
 

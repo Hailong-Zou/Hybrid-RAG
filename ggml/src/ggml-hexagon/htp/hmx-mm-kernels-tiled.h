@@ -431,6 +431,84 @@ static void dequantize_tiled_weight_to_fp16_task_mxfp4(
     }
 }
 
+
+static void dequantize_tiled_weight_to_fp16_task_q6_K(
+        const tiled_dequantize_state_t *state,
+        uint32_t start_tile, uint32_t end_tile) {
+
+    for (uint32_t t = start_tile; t < end_tile; t++) {
+        const uint8_t * tile_src =
+            state->src + t * state->aligned_tile_size;
+
+        __fp16 * dst_ptr =
+            state->dst + t * HTP_MM_HMX_TILE_N_ELMS;
+
+        // 64 FP16 scales:
+        // [s0_row0,s1_row0,s0_row1,s1_row1,...]
+        HVX_Vector vscale_pair =
+            hvx_vmem(tile_src + 1024);
+
+        HVX_VectorPair scale_deal =
+            Q6_W_vdeal_VVR(
+                vscale_pair,
+                vscale_pair,
+                -2);
+
+        HVX_Vector vs0 = Q6_V_lo_W(scale_deal);
+        HVX_Vector vs1 = Q6_V_hi_W(scale_deal);
+
+        HVX_Vector scale0_dup =
+            Q6_V_lo_W(
+                Q6_W_vshuff_VVR(
+                    vs0, vs0, -2));
+
+        HVX_Vector scale1_dup =
+            Q6_V_lo_W(
+                Q6_W_vshuff_VVR(
+                    vs1, vs1, -2));
+
+#define Q6K_DEQUANT_GROUP(G, SCALE)                           \
+        do {                                                  \
+            HVX_Vector vq =                                   \
+                hvx_vmem(tile_src + (G) * 128);               \
+                                                               \
+            HVX_VectorPair q16 =                              \
+                Q6_Wh_vunpack_Vb(vq);                         \
+                                                               \
+            HVX_Vector lo =                                   \
+                Q6_Vhf_equals_Vqf16(                          \
+                    Q6_Vqf16_vmpy_VhfVhf(                     \
+                        Q6_Vhf_equals_Vh(                      \
+                            Q6_V_lo_W(q16)),                   \
+                        (SCALE)));                             \
+                                                               \
+            HVX_Vector hi =                                   \
+                Q6_Vhf_equals_Vqf16(                          \
+                    Q6_Vqf16_vmpy_VhfVhf(                     \
+                        Q6_Vhf_equals_Vh(                      \
+                            Q6_V_hi_W(q16)),                   \
+                        (SCALE)));                             \
+                                                               \
+            hvx_vmem(dst_ptr + ((G)*2 + 0)*64) = lo;          \
+            hvx_vmem(dst_ptr + ((G)*2 + 1)*64) = hi;          \
+        } while (0)
+
+        // K 0..15
+        Q6K_DEQUANT_GROUP(0, scale0_dup);
+        Q6K_DEQUANT_GROUP(1, scale0_dup);
+        Q6K_DEQUANT_GROUP(2, scale0_dup);
+        Q6K_DEQUANT_GROUP(3, scale0_dup);
+
+        // K 16..31
+        Q6K_DEQUANT_GROUP(4, scale1_dup);
+        Q6K_DEQUANT_GROUP(5, scale1_dup);
+        Q6K_DEQUANT_GROUP(6, scale1_dup);
+        Q6K_DEQUANT_GROUP(7, scale1_dup);
+
+#undef Q6K_DEQUANT_GROUP
+    }
+}
+
 static void dequantize_tiled_weight_to_fp16_task_q8_0(
         const tiled_dequantize_state_t *state,
         uint32_t start_tile, uint32_t end_tile) {

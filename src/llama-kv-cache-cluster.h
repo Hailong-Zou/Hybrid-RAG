@@ -74,7 +74,9 @@ public:
     // Score-based token selection (TopK equivalent)
     // Item 7: accepts optional Q vector for real attention score
     std::vector<uint32_t> select_topk_tokens(const float * query, int k_tokens,
-                                              const float * q_vector = nullptr);
+                                              const float * q_vector = nullptr,
+                                              uint32_t current_cell_idx = UINT32_MAX);
+    std::vector<uint32_t> select_positions_for_seq(llama_seq_id seq_id);
 
     // ClusterView: unified view of cluster data (memory, disk, or buffer)
     ClusterView acquire_cluster_view(int32_t cluster_id, int32_t il);

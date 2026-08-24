@@ -665,6 +665,20 @@ struct llama_model {
     const struct ggml_tensor * get_tensor(const char * name) const;
 
     bool supports_mmap_weight_offload() const;
+
+    // Runtime residency for physically shared REPACK layer chunks.
+    bool supports_repack_chunk_residency() const;
+
+    // Full asynchronous REPACK residency path.
+    // HTP_REPACK always uses it; CPU_REPACK uses it when
+    // LLAMA_REPACK_ASYNC_CPU=1. The released parity slot may then be
+    // prepared by the background thread with Flash/GGUF read +
+    // backend set/repack while the opposite slot is computing.
+    bool repack_async_backend_set_enabled() const;
+
+    bool repack_prefetch_chunk_async(int32_t chunk_id) const;
+    bool repack_load_chunk(int32_t chunk_id) const;
+
     // Layer-by-layer weight offloading via madvise:
     // advice = MADV_DONTNEED (release physical pages), MADV_WILLNEED (preload), MADV_SEQUENTIAL
     void madvise_all_weights(int advice) const;

@@ -1235,14 +1235,19 @@ private:
             params_base.load_progress_callback_user_data = &load_progress_text;
         }
 
-        // Layer paging belongs to the mmap-backed CPU decode model.  The NPU
-        // producer is normally --no-mmap and must never enter layer offload.
+        // Preserve layer_chunks for the target model so REPACK weights can be
+        // grouped by logical transformer chunk during model loading.
+        //
+        // This does not enable the legacy mmap madvise path for --no-mmap
+        // producers: llama_context independently gates that path with
+        // model.supports_mmap_weight_offload().
         common_params params_target = params_base;
+
         if (params_base.generation_decode_cpu && params_base.layer_chunks > 0) {
-            params_target.layer_chunks = 0;
             SRV_INF(
-                    "LAYER_OFFLOAD_ROUTE: producer_layer_chunks=0 "
-                    "decode_cpu_layer_chunks=%d\n",
+                    "LAYER_OFFLOAD_ROUTE: producer_model_chunks=%d "
+                    "decode_cpu_layer_chunks=%d mmap_path_runtime_guarded=1\n",
+                    params_target.layer_chunks,
                     params_base.layer_chunks);
         }
 
@@ -1296,6 +1301,14 @@ private:
                     0.0f,
                     &load_progress_decode_cpu);
             load_progress_decode_cpu.t_last_load_progress_ms = 0;
+
+            SRV_WRN(
+                    "DECODE_CPU_MODEL_CONFIG: layer_chunks=%d "
+                    "no_extra_bufts=%d use_mmap=%d n_gpu_layers=%d\n",
+                    params_decode_cpu.layer_chunks,
+                    params_decode_cpu.no_extra_bufts ? 1 : 0,
+                    params_decode_cpu.use_mmap ? 1 : 0,
+                    params_decode_cpu.n_gpu_layers);
 
             SRV_INF(
                     "loading dedicated CPU Generation Decode model "

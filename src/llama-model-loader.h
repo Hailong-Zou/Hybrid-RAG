@@ -103,14 +103,33 @@ struct llama_model_loader {
     size_t size_data = 0;
     std::vector<std::pair<size_t, size_t>> mmaps_used;
 
-    // define a comparator for the buft -> ctx map to ensure that the order is well-defined:
-    struct ggml_backend_buft_comparator {
-        bool operator()(const ggml_backend_buffer_type_t & lhs, const ggml_backend_buffer_type_t & rhs) const {
-            return strcmp(ggml_backend_buft_name(lhs), ggml_backend_buft_name(rhs)) < 0;
+    // Context key used for model-weight allocation.
+    //
+    // Non-REPACK tensors always use repack_chunk = -1 and preserve the
+    // historical one-context-per-buffer-type behavior.
+    //
+    // REPACK tensors may use repack_chunk >= 0 so transformer-layer chunks
+    // can be allocated as independent backend buffers.
+    struct ctx_key {
+        ggml_backend_buffer_type_t buft = nullptr;
+        int32_t repack_chunk = -1;
+    };
+
+    struct ctx_key_comparator {
+        bool operator()(const ctx_key & lhs, const ctx_key & rhs) const {
+            const int name_cmp = strcmp(
+                    ggml_backend_buft_name(lhs.buft),
+                    ggml_backend_buft_name(rhs.buft));
+
+            if (name_cmp != 0) {
+                return name_cmp < 0;
+            }
+
+            return lhs.repack_chunk < rhs.repack_chunk;
         }
     };
 
-    std::map<ggml_backend_buffer_type_t, ggml_context_ptr, ggml_backend_buft_comparator> ctx_map;
+    std::map<ctx_key, ggml_context_ptr, ctx_key_comparator> ctx_map;
 
     // track tensors that had to be moved for debugging:
     size_t n_tensors_moved = 0;
@@ -180,7 +199,8 @@ struct llama_model_loader {
 
     struct ggml_tensor * create_tensor(
         const llama_hparams & hparams, const buft_list_t * buft_list_cpu, const buft_list_t * buft_list_input, const buft_list_t * buft_list_output,
-        const buft_list_t * buft_list_layer, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags);
+        const buft_list_t * buft_list_layer, int32_t repack_chunk_id,
+        const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags);
 
     struct ggml_tensor * create_tensor_as_view(struct ggml_context * ctx, struct ggml_tensor * base, const std::string & name, const std::initializer_list<int64_t> & ne, size_t offset, bool required = true);
 

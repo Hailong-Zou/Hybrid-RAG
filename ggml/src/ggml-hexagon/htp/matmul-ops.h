@@ -23,6 +23,7 @@ extern "C" {
 #define HTP_MM_WEIGHT_TILE_SIZE_Q4_0   576
 #define HTP_MM_WEIGHT_TILE_SIZE_Q4_1   640
 #define HTP_MM_WEIGHT_TILE_SIZE_Q8_0   1088
+#define HTP_MM_WEIGHT_TILE_SIZE_Q6_K   1152
 #define HTP_MM_WEIGHT_TILE_SIZE_IQ4_NL 576
 #define HTP_MM_WEIGHT_TILE_SIZE_MXFP4  544
 
@@ -30,6 +31,7 @@ extern "C" {
 #define HTP_MM_WEIGHT_ALIGNED_TILE_SIZE_Q4_0   640
 #define HTP_MM_WEIGHT_ALIGNED_TILE_SIZE_Q4_1   640
 #define HTP_MM_WEIGHT_ALIGNED_TILE_SIZE_Q8_0   1152
+#define HTP_MM_WEIGHT_ALIGNED_TILE_SIZE_Q6_K   1152
 #define HTP_MM_WEIGHT_ALIGNED_TILE_SIZE_IQ4_NL 640
 #define HTP_MM_WEIGHT_ALIGNED_TILE_SIZE_MXFP4  640
 
@@ -194,6 +196,8 @@ static inline uint32_t htp_mm_get_weight_tile_size(int weight_type) {
             return HTP_MM_WEIGHT_TILE_SIZE_Q4_1;
         case HTP_TYPE_Q8_0:
             return HTP_MM_WEIGHT_TILE_SIZE_Q8_0;
+        case HTP_TYPE_Q6_K:
+            return HTP_MM_WEIGHT_TILE_SIZE_Q6_K;
         case HTP_TYPE_MXFP4:
             return HTP_MM_WEIGHT_TILE_SIZE_MXFP4;
         default:
@@ -210,6 +214,8 @@ static inline uint32_t htp_mm_get_weight_aligned_tile_size(int weight_type) {
             return HTP_MM_WEIGHT_ALIGNED_TILE_SIZE_Q4_1;
         case HTP_TYPE_Q8_0:
             return HTP_MM_WEIGHT_ALIGNED_TILE_SIZE_Q8_0;
+        case HTP_TYPE_Q6_K:
+            return HTP_MM_WEIGHT_ALIGNED_TILE_SIZE_Q6_K;
         case HTP_TYPE_MXFP4:
             return HTP_MM_WEIGHT_ALIGNED_TILE_SIZE_MXFP4;
         default:
@@ -251,6 +257,7 @@ static inline size_t htp_mm_get_tiled_row_stride(int weight_type, uint32_t k) {
         case HTP_TYPE_IQ4_NL:
         case HTP_TYPE_Q4_1:
         case HTP_TYPE_Q8_0:
+        case HTP_TYPE_Q6_K:
         case HTP_TYPE_MXFP4:
             return (size_t) nb * htp_mm_get_weight_tile_size(weight_type);
         case HTP_TYPE_F16:

@@ -1053,11 +1053,26 @@ static ggml_backend_buffer_type_t select_weight_buft(const llama_hparams & hpara
 
 struct ggml_tensor * llama_model_loader::create_tensor(
         const llama_hparams & hparams, const buft_list_t * buft_list_cpu, const buft_list_t * buft_list_input, const buft_list_t * buft_list_output,
-        const buft_list_t * buft_list_layer, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags) {
+        const buft_list_t * buft_list_layer, int32_t repack_chunk_id,
+        const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags) {
     auto ctx_for_buft = [&](ggml_backend_buffer_type_t buft) -> ggml_context * {
-        auto it = ctx_map.find(buft);
+        int32_t effective_chunk = -1;
+
+        const char * buft_name = ggml_backend_buft_name(buft);
+        if (repack_chunk_id >= 0 &&
+                buft_name != nullptr &&
+                strstr(buft_name, "REPACK") != nullptr) {
+            effective_chunk = repack_chunk_id;
+        }
+
+        const ctx_key key = {
+            /*.buft         =*/ buft,
+            /*.repack_chunk =*/ effective_chunk,
+        };
+
+        auto it = ctx_map.find(key);
         if (it == ctx_map.end()) {
-            // one ggml context per buffer type
+            // one context per buffer type, or per REPACK logical chunk
             int max_n_tensors = n_tensors;
             max_n_tensors += 1;                   // duplicated output tensor
             max_n_tensors += hparams.n_layer()*2; // duplicated rope freq tensors
@@ -1077,7 +1092,7 @@ struct ggml_tensor * llama_model_loader::create_tensor(
                 throw std::runtime_error(format("failed to create ggml context"));
             }
 
-            ctx_map.emplace(buft, ctx);
+            ctx_map.emplace(key, ctx);
 
             return ctx;
         }

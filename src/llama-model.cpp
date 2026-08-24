@@ -29,9 +29,12 @@
 #include <cassert>
 #include <cfloat>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <cmath>
 #include <functional>
+#include <future>
 #include <map>
 #include <numeric>
 #include <regex>
@@ -1003,6 +1006,77 @@ struct llama_model::impl {
     llama_mlocks mlock_bufs;
     llama_mlocks mlock_mmaps;
 
+    // HTP REPACK layer chunks share two physical residency slots.
+    // Tensor metadata remains permanently bound to one of these slot buffers;
+    // chunk contents will be synchronously reloaded before execution.
+    struct repack_slot_group {
+        ggml_backend_buffer_type_t buft = nullptr;
+        size_t slot_size = 0;
+        std::vector<ggml_backend_buffer_ptr> slots;
+
+        // Which logical chunk currently occupies each physical slot.
+        // Initial model loading intentionally leaves this unknown because
+        // several logical chunks overwrite the same slot.
+        int32_t resident_chunk[2] = { -1, -1 };
+    };
+
+    struct repack_tensor_reload {
+        ggml_tensor * tensor = nullptr;
+
+        uint16_t file_idx = 0;
+        size_t file_offset = 0;
+
+        // Bytes in the original GGUF representation (Q4_K/Q6_K/etc.).
+        // ggml_backend_tensor_set() performs the existing backend repack.
+        size_t source_nbytes = 0;
+    };
+
+    struct repack_chunk_binding {
+        int32_t chunk_id = -1;
+        int32_t slot_id  = -1;
+        size_t slot_data_offset = 0;
+        size_t alloc_size = 0;
+        ggml_context * ctx = nullptr;
+        ggml_backend_buffer_type_t buft = nullptr;
+
+        std::vector<repack_tensor_reload> tensors;
+    };
+
+    // Declared before ctxs_bufs so tensor contexts are destroyed before
+    // their shared physical slot buffers.
+    std::vector<repack_slot_group> repack_slot_groups;
+    std::vector<repack_chunk_binding> repack_chunk_bindings;
+
+    // GGUF files retained after llama_model_loader destruction so evicted
+    // logical chunks can be reconstructed into a REPACK slot.
+    llama_files repack_files;
+
+    // Async REPACK pipeline.
+    //
+    // CPU_REPACK keeps Step 1:
+    //     Flash/GGUF -> host DRAM runs in background,
+    //     set_tensor()/REPACK remains synchronous.
+    //
+    // HTP REPACK uses experimental Step 2:
+    //     Flash/GGUF -> host DRAM -> set_tensor()/REPACK
+    //     all run in the background after the destination parity slot has
+    //     been released by the previous HTP chunk.
+    struct repack_prefetch_result {
+        int32_t chunk_id = -1;
+        bool ok = false;
+        bool backend_set_done = false;
+        bool prepacked_load_done = false;
+        std::string error;
+        size_t source_bytes = 0;
+        int64_t read_us = 0;
+        int64_t set_tensor_us = 0;
+        int64_t total_us = 0;
+        std::vector<std::vector<uint8_t>> tensor_data;
+    };
+
+    int32_t repack_prefetch_chunk_id = -1;
+    std::future<repack_prefetch_result> repack_prefetch_future;
+
     // contexts where the model tensors metadata is stored as well as the corresponding buffers:
     std::vector<std::pair<ggml_context_ptr, std::vector<ggml_backend_buffer_ptr>>> ctxs_bufs;
 
@@ -1546,7 +1620,90 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     const size_t n_max_backend_buffer = ml.ctx_map.size() * ml.files.size();
     pimpl->ctxs_bufs.reserve(n_max_backend_buffer);
 
-    for (auto & [buft, ctx_ptr] : ml.ctx_map) {
+    auto is_repack_residency_chunk = [](const llama_model_loader::ctx_key & key) {
+        if (key.repack_chunk < 0 || key.buft == nullptr) {
+            return false;
+        }
+
+        const char * name = ggml_backend_buft_name(key.buft);
+        if (name == nullptr) {
+            return false;
+        }
+
+        // Snapdragon producer path.
+        const bool htp_repack =
+                strstr(name, "HTP") != nullptr &&
+                strstr(name, "REPACK") != nullptr;
+
+        // CPU decode path.
+        const bool cpu_repack =
+                strcmp(name, "CPU_REPACK") == 0;
+
+        return htp_repack || cpu_repack;
+    };
+
+    auto find_repack_slot_group =
+            [&](ggml_backend_buffer_type_t buft) -> llama_model::impl::repack_slot_group * {
+        for (auto & group : pimpl->repack_slot_groups) {
+            if (group.buft == buft) {
+                return &group;
+            }
+        }
+        return nullptr;
+    };
+
+    // Determine the largest logical REPACK chunk for each buffer type.
+    // Two physical buffers of this size are sufficient for alternating chunks.
+    for (auto & [ctx_key, ctx_ptr] : ml.ctx_map) {
+        if (!is_repack_residency_chunk(ctx_key)) {
+            continue;
+        }
+
+        const size_t chunk_size =
+                ggml_backend_alloc_ctx_tensors_from_buft_size(
+                        ctx_ptr.get(), ctx_key.buft);
+
+        auto * group = find_repack_slot_group(ctx_key.buft);
+        if (!group) {
+            llama_model::impl::repack_slot_group new_group;
+            new_group.buft = ctx_key.buft;
+            new_group.slot_size = chunk_size;
+            pimpl->repack_slot_groups.emplace_back(std::move(new_group));
+        } else {
+            group->slot_size = std::max(group->slot_size, chunk_size);
+        }
+    }
+
+    // Allocate exactly two physical REPACK residency slots per buffer type.
+    for (auto & group : pimpl->repack_slot_groups) {
+        for (int slot_id = 0; slot_id < 2; ++slot_id) {
+            ggml_backend_buffer_t raw =
+                    ggml_backend_buft_alloc_buffer(group.buft, group.slot_size);
+
+            if (raw == nullptr) {
+                throw std::runtime_error(format(
+                        "unable to allocate REPACK residency slot %d for %s (%zu bytes)",
+                        slot_id,
+                        ggml_backend_buft_name(group.buft),
+                        group.slot_size));
+            }
+
+            ggml_backend_buffer_set_usage(
+                    raw, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+
+            LLAMA_LOG_INFO(
+                    "REPACK_SLOT_ALLOC: buft=%s slot=%d requested_bytes=%zu actual_bytes=%zu\n",
+                    ggml_backend_buft_name(group.buft),
+                    slot_id,
+                    group.slot_size,
+                    ggml_backend_buffer_get_size(raw));
+
+            group.slots.emplace_back(raw);
+        }
+    }
+
+    for (auto & [ctx_key, ctx_ptr] : ml.ctx_map) {
+        ggml_backend_buffer_type_t buft = ctx_key.buft;
         ggml_context * ctx = ctx_ptr.get();
 
         // skip contexts without tensors
@@ -1556,6 +1713,119 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 
         llama_buf_map buf_map;
         buf_map.reserve(n_max_backend_buffer);
+
+        // Layer REPACK chunks use two fixed physical buffers.
+        // Different logical chunks intentionally overlap in virtual tensor
+        // addresses within the same parity slot. Before a chunk executes,
+        // runtime residency code reloads its original GGUF weights into that slot.
+        if (is_repack_residency_chunk(ctx_key)) {
+            auto * group = find_repack_slot_group(buft);
+            GGML_ASSERT(group != nullptr);
+            GGML_ASSERT(group->slots.size() == 2);
+
+            const int32_t slot_id = ctx_key.repack_chunk & 1;
+            ggml_backend_buffer_t slot = group->slots.at(slot_id).get();
+
+            const size_t alignment = ggml_backend_buffer_get_alignment(slot);
+            GGML_ASSERT(alignment > 0 && (alignment & (alignment - 1)) == 0);
+
+            char * base = static_cast<char *>(ggml_backend_buffer_get_base(slot));
+            size_t offset =
+                    (alignment - (reinterpret_cast<uintptr_t>(base) % alignment)) %
+                    alignment;
+
+            for (ggml_tensor * t = ggml_get_first_tensor(ctx);
+                    t != nullptr;
+                    t = ggml_get_next_tensor(ctx, t)) {
+                GGML_ASSERT(t->buffer == nullptr);
+                GGML_ASSERT(t->data == nullptr);
+                GGML_ASSERT(t->view_src == nullptr);
+
+                const size_t alloc_size = GGML_PAD(
+                        ggml_backend_buffer_get_alloc_size(slot, t),
+                        alignment);
+
+                if (offset + alloc_size > ggml_backend_buffer_get_size(slot)) {
+                    throw std::runtime_error(format(
+                            "REPACK residency slot overflow: buft=%s chunk=%d tensor=%s "
+                            "offset=%zu alloc=%zu slot=%zu",
+                            ggml_backend_buft_name(buft),
+                            ctx_key.repack_chunk,
+                            ggml_get_name(t),
+                            offset,
+                            alloc_size,
+                            ggml_backend_buffer_get_size(slot)));
+                }
+
+                const enum ggml_status status =
+                        ggml_backend_tensor_alloc(slot, t, base + offset);
+
+                if (status != GGML_STATUS_SUCCESS) {
+                    throw std::runtime_error(format(
+                            "failed to bind tensor %s to REPACK buffer %s slot %d",
+                            ggml_get_name(t),
+                            ggml_backend_buft_name(buft),
+                            slot_id));
+                }
+
+                offset += alloc_size;
+            }
+
+            for (uint32_t idx = 0; idx < ml.files.size(); ++idx) {
+                buf_map.emplace(idx, slot);
+            }
+
+            llama_model::impl::repack_chunk_binding binding;
+            binding.chunk_id        = ctx_key.repack_chunk;
+            binding.slot_id         = slot_id;
+            binding.slot_data_offset =
+                    (alignment - (reinterpret_cast<uintptr_t>(base) % alignment)) %
+                    alignment;
+            binding.alloc_size      = offset;
+            binding.ctx             = ctx;
+            binding.buft       = buft;
+
+            for (ggml_tensor * t = ggml_get_first_tensor(ctx);
+                    t != nullptr;
+                    t = ggml_get_next_tensor(ctx, t)) {
+                const auto * weight = ml.get_weight(ggml_get_name(t));
+
+                if (weight == nullptr) {
+                    continue;
+                }
+
+                binding.tensors.push_back({
+                        /*.tensor        =*/ t,
+                        /*.file_idx      =*/ weight->idx,
+                        /*.file_offset   =*/ weight->offs,
+                        /*.source_nbytes =*/ ggml_nbytes(t),
+                });
+            }
+
+            LLAMA_LOG_INFO(
+                    "REPACK_CHUNK_DESCRIPTOR: chunk=%d slot=%d tensors=%zu source_ready=1\n",
+                    binding.chunk_id,
+                    binding.slot_id,
+                    binding.tensors.size());
+
+            pimpl->repack_chunk_bindings.emplace_back(std::move(binding));
+
+            LLAMA_LOG_WARN(
+                    "REPACK_CHUNK_BIND: buft=%s chunk=%d slot=%d used_bytes=%zu\n",
+                    ggml_backend_buft_name(buft),
+                    ctx_key.repack_chunk,
+                    slot_id,
+                    offset);
+
+            // Keep the ggml context alive, but slot ownership lives in
+            // repack_slot_groups and must not be duplicated here.
+            pimpl->ctxs_bufs.emplace_back(
+                    std::move(ctx_ptr),
+                    std::vector<ggml_backend_buffer_ptr>{});
+
+            ctx_buf_maps.emplace_back(ctx, buf_map);
+            continue;
+        }
 
         // check if it is possible to use buffer_from_host_ptr with this buffer type
         ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
@@ -1653,6 +1923,165 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         }
     }
 
+    // REPACK_RESIDENCY_DIAG_BEGIN
+    // Diagnostic only: report the physical allocation footprint of repacked
+    // weight tensors by transformer layer/chunk. This does not change
+    // allocation, placement, residency, or execution behavior.
+    {
+        const int n_layers_diag = (int) hparams.n_layer();
+
+        std::vector<size_t> htp_repack_by_layer(
+                std::max(n_layers_diag, 0), 0);
+        std::vector<size_t> cpu_repack_by_layer(
+                std::max(n_layers_diag, 0), 0);
+
+        size_t htp_repack_tensor_bytes   = 0;
+        size_t cpu_repack_tensor_bytes   = 0;
+        size_t other_repack_tensor_bytes = 0;
+
+        for (const auto & [name, tensor] : tensors_by_name) {
+            if (!tensor || !tensor->buffer) {
+                continue;
+            }
+
+            ggml_backend_buffer_type_t buft =
+                    ggml_backend_buffer_get_type(tensor->buffer);
+            if (!buft) {
+                continue;
+            }
+
+            const char * buft_name_c = ggml_backend_buft_name(buft);
+            const std::string buft_name =
+                    buft_name_c ? buft_name_c : "";
+
+            if (buft_name.find("REPACK") == std::string::npos) {
+                continue;
+            }
+
+            size_t bytes =
+                    ggml_backend_buft_get_alloc_size(buft, tensor);
+
+            // Match backend allocator alignment as closely as possible.
+            const size_t alignment =
+                    ggml_backend_buft_get_alignment(buft);
+            if (alignment > 1) {
+                const size_t rem = bytes % alignment;
+                if (rem != 0) {
+                    bytes += alignment - rem;
+                }
+            }
+
+            int layer = -1;
+            const auto blk_pos = name.find("blk.");
+            if (blk_pos != std::string::npos) {
+                layer = atoi(name.c_str() + blk_pos + 4);
+            }
+
+            if (buft_name.find("HTP") != std::string::npos) {
+                htp_repack_tensor_bytes += bytes;
+                if (layer >= 0 && layer < n_layers_diag) {
+                    htp_repack_by_layer[layer] += bytes;
+                }
+            } else if (buft_name.find("CPU") != std::string::npos) {
+                cpu_repack_tensor_bytes += bytes;
+                if (layer >= 0 && layer < n_layers_diag) {
+                    cpu_repack_by_layer[layer] += bytes;
+                }
+            } else {
+                other_repack_tensor_bytes += bytes;
+            }
+        }
+
+        size_t htp_repack_buffer_bytes = 0;
+        size_t cpu_repack_buffer_bytes = 0;
+        size_t other_repack_buffer_bytes = 0;
+
+        for (const auto & [ctx, bufs] : pimpl->ctxs_bufs) {
+            GGML_UNUSED(ctx);
+
+            for (const auto & buf : bufs) {
+                if (!buf) {
+                    continue;
+                }
+
+                const char * name_c =
+                        ggml_backend_buffer_name(buf.get());
+                const std::string name =
+                        name_c ? name_c : "";
+
+                if (name.find("REPACK") == std::string::npos) {
+                    continue;
+                }
+
+                const size_t bytes =
+                        ggml_backend_buffer_get_size(buf.get());
+
+                if (name.find("HTP") != std::string::npos) {
+                    htp_repack_buffer_bytes += bytes;
+                } else if (name.find("CPU") != std::string::npos) {
+                    cpu_repack_buffer_bytes += bytes;
+                } else {
+                    other_repack_buffer_bytes += bytes;
+                }
+            }
+        }
+
+        LLAMA_LOG_INFO(
+                "REPACK_TOTAL: "
+                "htp_tensor_bytes=%zu htp_buffer_bytes=%zu "
+                "cpu_tensor_bytes=%zu cpu_buffer_bytes=%zu "
+                "other_tensor_bytes=%zu other_buffer_bytes=%zu\n",
+                htp_repack_tensor_bytes,
+                htp_repack_buffer_bytes,
+                cpu_repack_tensor_bytes,
+                cpu_repack_buffer_bytes,
+                other_repack_tensor_bytes,
+                other_repack_buffer_bytes);
+
+        for (int il = 0; il < n_layers_diag; ++il) {
+            LLAMA_LOG_INFO(
+                    "REPACK_LAYER_BYTES: "
+                    "layer=%d htp_repack_bytes=%zu cpu_repack_bytes=%zu\n",
+                    il,
+                    htp_repack_by_layer[il],
+                    cpu_repack_by_layer[il]);
+        }
+
+        // Current experiment uses 36 layers / 9 logical chunks.
+        // Diagnostic only; do not alter allocation based on this value yet.
+        constexpr int diagnostic_chunks = 9;
+
+        if (n_layers_diag > 0 &&
+                n_layers_diag % diagnostic_chunks == 0) {
+            const int layers_per_chunk =
+                    n_layers_diag / diagnostic_chunks;
+
+            for (int c = 0; c < diagnostic_chunks; ++c) {
+                const int begin = c * layers_per_chunk;
+                const int end   = begin + layers_per_chunk;
+
+                size_t htp_bytes = 0;
+                size_t cpu_bytes = 0;
+
+                for (int il = begin; il < end; ++il) {
+                    htp_bytes += htp_repack_by_layer[il];
+                    cpu_bytes += cpu_repack_by_layer[il];
+                }
+
+                LLAMA_LOG_INFO(
+                        "REPACK_CHUNK_BYTES: "
+                        "chunk=%d layers=%d-%d "
+                        "htp_repack_bytes=%zu cpu_repack_bytes=%zu\n",
+                        c,
+                        begin,
+                        end - 1,
+                        htp_bytes,
+                        cpu_bytes);
+            }
+        }
+    }
+    // REPACK_RESIDENCY_DIAG_END
+
     if (ml.no_alloc) {
         return true;
     }
@@ -1662,6 +2091,23 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         if (!ml.load_all_data(ctx, buf_map, use_mlock ? &pimpl->mlock_mmaps : NULL, params.progress_callback, params.progress_callback_user_data)) {
             return false;
         }
+    }
+
+    // llama_model_loader is destroyed after model load.  Keep the original
+    // GGUF file handles only for models that actually use shared REPACK
+    // residency so runtime chunk reload remains possible.
+    if (!pimpl->repack_chunk_bindings.empty()) {
+        if (ml.files.empty()) {
+            throw std::runtime_error(
+                    "REPACK residency requires persistent GGUF file handles");
+        }
+
+        pimpl->repack_files = std::move(ml.files);
+
+        LLAMA_LOG_WARN(
+                "REPACK_RELOAD_SOURCE_READY: files=%zu chunks=%zu\n",
+                pimpl->repack_files.size(),
+                pimpl->repack_chunk_bindings.size());
     }
 
     if (use_mmap_buffer) {
@@ -1675,9 +2121,24 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 
 ggml_tensor * llama_model_base::create_tensor(llama_model_loader & ml, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags) {
     const buft_list_t * buft_list_layer = tn.bid == -1 ? nullptr : pimpl->dev_layer.at(tn.bid).buft_list;
+
+    int32_t repack_chunk_id = -1;
+
+    const int32_t n_layers = (int32_t) hparams.n_layer();
+    const int32_t n_chunks = params.layer_chunks;
+
+    if (n_chunks > 0 &&
+            n_layers > 0 &&
+            n_layers % n_chunks == 0 &&
+            tn.bid >= 0 &&
+            tn.bid < n_layers) {
+        const int32_t layers_per_chunk = n_layers / n_chunks;
+        repack_chunk_id = tn.bid / layers_per_chunk;
+    }
+
     return ml.create_tensor(
         hparams, &pimpl->cpu_buft_list, pimpl->dev_input.buft_list, pimpl->dev_output.buft_list, buft_list_layer,
-        tn, ne, flags);
+        repack_chunk_id, tn, ne, flags);
 }
 
 std::string llama_model::arch_name() const {
@@ -1723,7 +2184,14 @@ llama_split_mode llama_model::split_mode() const {
 
 std::map<ggml_backend_buffer_type_t, size_t> llama_model::memory_breakdown() const {
     std::map<ggml_backend_buffer_type_t, size_t> ret;
+
     for (const auto & [ctx, bufs] : pimpl->ctxs_bufs) {
+        // Shared HTP REPACK chunk contexts intentionally own no buffer here.
+        // Their physical storage is owned once by repack_slot_groups below.
+        if (bufs.empty()) {
+            continue;
+        }
+
         if (hparams.no_alloc) {
             GGML_ASSERT(bufs.size() == 1);
             ggml_backend_buffer_t buf = bufs[0].get();
@@ -1737,6 +2205,21 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_model::memory_breakdown() con
             }
         }
     }
+
+    // REPACK logical chunks share a small number of physical residency slots.
+    // Count each physical slot exactly once rather than summing the logical
+    // per-chunk tensor sizes.
+    for (const auto & group : pimpl->repack_slot_groups) {
+        for (const auto & slot : group.slots) {
+            if (!slot) {
+                continue;
+            }
+
+            ret[ggml_backend_buffer_get_type(slot.get())] +=
+                    ggml_backend_buffer_get_size(slot.get());
+        }
+    }
+
     return ret;
 }
 
@@ -2036,6 +2519,843 @@ const ggml_tensor * llama_model::get_tensor(const char * name) const {
 
 bool llama_model::supports_mmap_weight_offload() const {
     return !pimpl->mappings.empty();
+}
+
+bool llama_model::supports_repack_chunk_residency() const {
+    const bool ok =
+            !pimpl->repack_chunk_bindings.empty() &&
+            !pimpl->repack_slot_groups.empty() &&
+            !pimpl->repack_files.empty();
+
+    static std::atomic<int> diag_count { 0 };
+    if (diag_count.fetch_add(1) < 12) {
+        LLAMA_LOG_WARN(
+                "REPACK_SUPPORT_DIAG: model=%p bindings=%zu slot_groups=%zu files=%zu result=%d\n",
+                (const void *) this,
+                pimpl->repack_chunk_bindings.size(),
+                pimpl->repack_slot_groups.size(),
+                pimpl->repack_files.size(),
+                ok ? 1 : 0);
+    }
+
+    return ok;
+}
+
+bool llama_model::repack_async_backend_set_enabled() const {
+    const bool supports = supports_repack_chunk_residency();
+
+    static std::atomic<int> diag_count { 0 };
+    const bool diag = diag_count.fetch_add(1) < 12;
+
+    if (!supports) {
+        if (diag) {
+            LLAMA_LOG_WARN(
+                    "REPACK_ASYNC_ELIG: model=%p supports=0 bindings=%zu result=0\n",
+                    (const void *) this,
+                    pimpl->repack_chunk_bindings.size());
+        }
+        return false;
+    }
+
+    const char * cpu_async_env = getenv("LLAMA_REPACK_ASYNC_CPU");
+    const bool allow_cpu_async =
+            cpu_async_env != nullptr &&
+            atoi(cpu_async_env) == 1;
+
+    bool saw_repack_binding = false;
+
+    for (const auto & binding : pimpl->repack_chunk_bindings) {
+        const char * buft_name =
+                binding.buft != nullptr
+                    ? ggml_backend_buft_name(binding.buft)
+                    : nullptr;
+
+        if (diag) {
+            LLAMA_LOG_WARN(
+                    "REPACK_ASYNC_ELIG_BIND: model=%p chunk=%d slot=%d buft=%s allow_cpu=%d\n",
+                    (const void *) this,
+                    binding.chunk_id,
+                    binding.slot_id,
+                    buft_name ? buft_name : "null",
+                    allow_cpu_async ? 1 : 0);
+        }
+
+        if (buft_name == nullptr ||
+                strstr(buft_name, "REPACK") == nullptr) {
+            if (diag) {
+                LLAMA_LOG_WARN(
+                        "REPACK_ASYNC_ELIG_END: model=%p result=0 reason=non_repack\n",
+                        (const void *) this);
+            }
+            return false;
+        }
+
+        const bool is_htp =
+                strstr(buft_name, "HTP") != nullptr;
+
+        const bool is_cpu =
+                strcmp(buft_name, "CPU_REPACK") == 0;
+
+        if (is_htp || (is_cpu && allow_cpu_async)) {
+            saw_repack_binding = true;
+            continue;
+        }
+
+        if (diag) {
+            LLAMA_LOG_WARN(
+                    "REPACK_ASYNC_ELIG_END: model=%p result=0 buft=%s\n",
+                    (const void *) this,
+                    buft_name);
+        }
+        return false;
+    }
+
+    if (diag) {
+        LLAMA_LOG_WARN(
+                "REPACK_ASYNC_ELIG_END: model=%p result=%d\n",
+                (const void *) this,
+                saw_repack_binding ? 1 : 0);
+    }
+
+    return saw_repack_binding;
+}
+
+bool llama_model::repack_prefetch_chunk_async(int32_t chunk_id) const {
+    if (!supports_repack_chunk_residency()) {
+        return false;
+    }
+
+    // There must be at most one outstanding residency operation per model.
+    // repack_load_chunk() consumes it before the next chunk becomes active.
+    if (pimpl->repack_prefetch_future.valid()) {
+        LLAMA_LOG_ERROR(
+                "REPACK_ASYNC_PREFETCH_FAIL: chunk=%d "
+                "reason=prefetch_already_pending pending_chunk=%d\n",
+                chunk_id,
+                pimpl->repack_prefetch_chunk_id);
+        return false;
+    }
+
+    llama_model::impl::repack_chunk_binding * binding = nullptr;
+
+    for (auto & cur : pimpl->repack_chunk_bindings) {
+        if (cur.chunk_id == chunk_id) {
+            binding = &cur;
+            break;
+        }
+    }
+
+    if (binding == nullptr) {
+        LLAMA_LOG_ERROR(
+                "REPACK_ASYNC_PREFETCH_FAIL: chunk=%d reason=binding_not_found\n",
+                chunk_id);
+        return false;
+    }
+
+    const bool async_backend_set = repack_async_backend_set_enabled();
+    const char * buft_name =
+            binding->buft != nullptr
+                ? ggml_backend_buft_name(binding->buft)
+                : "unknown";
+
+    llama_model::impl::repack_slot_group * group = nullptr;
+    for (auto & cur : pimpl->repack_slot_groups) {
+        if (cur.buft == binding->buft) {
+            group = &cur;
+            break;
+        }
+    }
+
+    if (group == nullptr ||
+            binding->slot_id < 0 ||
+            binding->slot_id >= (int32_t) group->slots.size()) {
+        LLAMA_LOG_ERROR(
+                "REPACK_ASYNC_PREFETCH_FAIL: chunk=%d reason=slot_not_found\n",
+                chunk_id);
+        return false;
+    }
+
+    ggml_backend_buffer_t slot =
+            group->slots.at(binding->slot_id).get();
+
+    pimpl->repack_prefetch_chunk_id = chunk_id;
+
+    try {
+        pimpl->repack_prefetch_future = std::async(
+                std::launch::async,
+                [this, binding, chunk_id, async_backend_set, slot]()
+                        -> llama_model::impl::repack_prefetch_result {
+                    llama_model::impl::repack_prefetch_result result;
+                    result.chunk_id = chunk_id;
+
+                    const int64_t total_t0 = ggml_time_us();
+
+                    try {
+                        // Offline-REPACK POC load path.
+                        //
+                        // A prepacked chunk contains the final physical HTP slot
+                        // image, excluding only the slot-base alignment prefix.
+                        // Restore it directly into the idle residency slot and
+                        // completely bypass per-tensor backend set_tensor/REPACK.
+                        const char * prepack_load_dir =
+                                std::getenv("LLAMA_REPACK_PREPACK_LOAD_DIR");
+
+                        if (prepack_load_dir != nullptr &&
+                                prepack_load_dir[0] != '\0' &&
+                                binding->buft != nullptr &&
+                                strstr(ggml_backend_buft_name(binding->buft), "HTP") != nullptr &&
+                                strstr(ggml_backend_buft_name(binding->buft), "REPACK") != nullptr) {
+                            const size_t load_offset = binding->slot_data_offset;
+
+                            if (binding->alloc_size < load_offset) {
+                                result.error = "prepacked_bad_range";
+                                result.total_us = ggml_time_us() - total_t0;
+                                return result;
+                            }
+
+                            const size_t load_size =
+                                    binding->alloc_size - load_offset;
+
+                            const std::string path = format(
+                                    "%s/chunk-%d.bin",
+                                    prepack_load_dir,
+                                    chunk_id);
+
+                            FILE * fp = std::fopen(path.c_str(), "rb");
+
+                            if (fp != nullptr) {
+                                if (std::fseek(fp, 0, SEEK_END) != 0) {
+                                    std::fclose(fp);
+                                    result.error = "prepacked_seek_end_failed";
+                                    result.total_us = ggml_time_us() - total_t0;
+                                    return result;
+                                }
+
+                                const long file_size = std::ftell(fp);
+
+                                if (file_size < 0 ||
+                                        (size_t) file_size != load_size ||
+                                        std::fseek(fp, 0, SEEK_SET) != 0) {
+                                    std::fclose(fp);
+                                    result.error = "prepacked_size_mismatch";
+                                    result.total_us = ggml_time_us() - total_t0;
+                                    return result;
+                                }
+
+                                char * slot_base = static_cast<char *>(
+                                        ggml_backend_buffer_get_base(slot));
+
+                                if (slot_base == nullptr) {
+                                    std::fclose(fp);
+                                    result.error = "prepacked_null_slot_base";
+                                    result.total_us = ggml_time_us() - total_t0;
+                                    return result;
+                                }
+
+                                const int64_t read_t0 = ggml_time_us();
+
+                                const size_t nread = std::fread(
+                                        slot_base + load_offset,
+                                        1,
+                                        load_size,
+                                        fp);
+
+                                const int close_rc = std::fclose(fp);
+
+                                result.read_us =
+                                        ggml_time_us() - read_t0;
+
+                                if (nread != load_size || close_rc != 0) {
+                                    result.error = "prepacked_read_failed";
+                                    result.total_us = ggml_time_us() - total_t0;
+                                    return result;
+                                }
+
+                                result.source_bytes = load_size;
+                                result.set_tensor_us = 0;
+                                result.backend_set_done = false;
+                                result.prepacked_load_done = true;
+                                result.total_us =
+                                        ggml_time_us() - total_t0;
+                                result.ok = true;
+
+                                LLAMA_LOG_WARN(
+                                        "REPACK_PREPACK_LOAD: chunk=%d slot=%d "
+                                        "offset=%zu bytes=%zu read_ms=%.3f path=%s\n",
+                                        chunk_id,
+                                        binding->slot_id,
+                                        load_offset,
+                                        load_size,
+                                        result.read_us / 1000.0,
+                                        path.c_str());
+
+                                return result;
+                            }
+
+                            LLAMA_LOG_WARN(
+                                    "REPACK_PREPACK_LOAD_MISS: chunk=%d path=%s "
+                                    "fallback=runtime_repack\n",
+                                    chunk_id,
+                                    path.c_str());
+                        }
+
+                        result.tensor_data.reserve(binding->tensors.size());
+
+                        const int64_t read_t0 = ggml_time_us();
+
+                        // Stage the complete logical GGUF chunk in host DRAM.
+                        for (const auto & desc : binding->tensors) {
+                            if (desc.tensor == nullptr ||
+                                    desc.file_idx >= pimpl->repack_files.size()) {
+                                result.error = "bad_descriptor";
+                                result.total_us = ggml_time_us() - total_t0;
+                                return result;
+                            }
+
+                            result.tensor_data.emplace_back(desc.source_nbytes);
+                            auto & buf = result.tensor_data.back();
+
+                            llama_file * file =
+                                    pimpl->repack_files.at(desc.file_idx).get();
+
+                            file->seek(desc.file_offset, SEEK_SET);
+                            file->read_raw(buf.data(), desc.source_nbytes);
+
+                            result.source_bytes += desc.source_nbytes;
+                        }
+
+                        result.read_us = ggml_time_us() - read_t0;
+
+                        // Step 2 is enabled only for HTP REPACK.  The caller
+                        // schedules this operation only after the destination
+                        // parity slot has been released by the preceding HTP
+                        // chunk, so this writes the idle slot while the other
+                        // slot is being consumed by HTP compute.
+                        if (async_backend_set) {
+                            const int64_t set_t0 = ggml_time_us();
+
+                            for (size_t i = 0;
+                                    i < binding->tensors.size();
+                                    ++i) {
+                                const auto & desc = binding->tensors[i];
+                                const auto & buf  = result.tensor_data[i];
+
+                                if (buf.size() != desc.source_nbytes) {
+                                    result.error =
+                                            "async_staged_size_mismatch";
+                                    result.set_tensor_us =
+                                            ggml_time_us() - set_t0;
+                                    result.total_us =
+                                            ggml_time_us() - total_t0;
+                                    return result;
+                                }
+
+                                // Q4_K -> Q4_1 tiled and the other existing
+                                // backend-specific REPACK transformations are
+                                // performed inside the buffer set_tensor path.
+                                ggml_backend_tensor_set(
+                                        desc.tensor,
+                                        buf.data(),
+                                        0,
+                                        desc.source_nbytes);
+                            }
+
+                            result.set_tensor_us =
+                                    ggml_time_us() - set_t0;
+                            result.backend_set_done = true;
+                        }
+
+                        result.total_us = ggml_time_us() - total_t0;
+                        result.ok = true;
+                    } catch (const std::exception & e) {
+                        result.total_us = ggml_time_us() - total_t0;
+                        result.error = e.what();
+                    }
+
+                    return result;
+                });
+
+        LLAMA_LOG_WARN(
+                "REPACK_ASYNC_PREFETCH: buft=%s chunk=%d "
+                "action=scheduled backend_set=%d\n",
+                buft_name,
+                chunk_id,
+                async_backend_set ? 1 : 0);
+
+        return true;
+    } catch (const std::exception & e) {
+        pimpl->repack_prefetch_chunk_id = -1;
+
+        LLAMA_LOG_ERROR(
+                "REPACK_ASYNC_PREFETCH_FAIL: buft=%s chunk=%d reason=%s\n",
+                buft_name,
+                chunk_id,
+                e.what());
+
+        return false;
+    }
+}
+
+bool llama_model::repack_load_chunk(int32_t chunk_id) const {
+    if (!supports_repack_chunk_residency()) {
+        return false;
+    }
+
+    llama_model::impl::repack_chunk_binding * binding = nullptr;
+
+    for (auto & cur : pimpl->repack_chunk_bindings) {
+        if (cur.chunk_id == chunk_id) {
+            binding = &cur;
+            break;
+        }
+    }
+
+    if (binding == nullptr) {
+        LLAMA_LOG_ERROR(
+                "REPACK_CHUNK_LOAD_FAIL: chunk=%d reason=binding_not_found\n",
+                chunk_id);
+        return false;
+    }
+
+    llama_model::impl::repack_slot_group * group = nullptr;
+
+    for (auto & cur : pimpl->repack_slot_groups) {
+        if (cur.buft == binding->buft) {
+            group = &cur;
+            break;
+        }
+    }
+
+    if (group == nullptr ||
+            binding->slot_id < 0 ||
+            binding->slot_id >= (int32_t) group->slots.size()) {
+        LLAMA_LOG_ERROR(
+                "REPACK_CHUNK_LOAD_FAIL: chunk=%d reason=slot_not_found\n",
+                chunk_id);
+        return false;
+    }
+
+    const int32_t slot_id = binding->slot_id;
+    const char * buft_name =
+            binding->buft != nullptr
+                ? ggml_backend_buft_name(binding->buft)
+                : "unknown";
+
+    if (slot_id < 2 && group->resident_chunk[slot_id] == chunk_id) {
+        LLAMA_LOG_INFO(
+                "REPACK_CHUNK_LOAD: buft=%s chunk=%d slot=%d action=hit\n",
+                buft_name,
+                chunk_id,
+                slot_id);
+        return true;
+    }
+
+    ggml_backend_buffer_t slot = group->slots.at(slot_id).get();
+
+    llama_model::impl::repack_prefetch_result prefetched;
+    bool staged = false;
+    int64_t prefetch_wait_us = 0;
+
+    if (pimpl->repack_prefetch_future.valid()) {
+        if (pimpl->repack_prefetch_chunk_id != chunk_id) {
+            LLAMA_LOG_ERROR(
+                    "REPACK_CHUNK_LOAD_FAIL: buft=%s chunk=%d "
+                    "reason=prefetch_chunk_mismatch pending_chunk=%d\n",
+                    buft_name,
+                    chunk_id,
+                    pimpl->repack_prefetch_chunk_id);
+            return false;
+        }
+
+        const int64_t wait_t0 = ggml_time_us();
+        prefetched = pimpl->repack_prefetch_future.get();
+        prefetch_wait_us = ggml_time_us() - wait_t0;
+        pimpl->repack_prefetch_chunk_id = -1;
+
+        if (!prefetched.ok) {
+            LLAMA_LOG_ERROR(
+                    "REPACK_CHUNK_LOAD_FAIL: buft=%s chunk=%d "
+                    "reason=async_pipeline_failed error=%s\n",
+                    buft_name,
+                    chunk_id,
+                    prefetched.error.c_str());
+            return false;
+        }
+
+        if (prefetched.chunk_id != chunk_id ||
+                (!prefetched.prepacked_load_done &&
+                 prefetched.tensor_data.size() != binding->tensors.size())) {
+            LLAMA_LOG_ERROR(
+                    "REPACK_CHUNK_LOAD_FAIL: buft=%s chunk=%d "
+                    "reason=bad_prefetch_result\n",
+                    buft_name,
+                    chunk_id);
+            return false;
+        }
+
+        staged = true;
+    }
+
+    // Offline-REPACK POC synchronous load path.
+    //
+    // chunk 0/1 normally arrive here without an async prefetch future.
+    // Restore their final physical HTP slot images directly from the
+    // prepacked sidecars, then reuse the common staged-result path below.
+    if (!staged) {
+        const char * prepack_load_dir =
+                std::getenv("LLAMA_REPACK_PREPACK_LOAD_DIR");
+
+        if (prepack_load_dir != nullptr &&
+                prepack_load_dir[0] != '\0' &&
+                binding->buft != nullptr &&
+                strstr(ggml_backend_buft_name(binding->buft), "HTP") != nullptr &&
+                strstr(ggml_backend_buft_name(binding->buft), "REPACK") != nullptr) {
+            const size_t load_offset = binding->slot_data_offset;
+
+            if (binding->alloc_size < load_offset) {
+                LLAMA_LOG_ERROR(
+                        "REPACK_PREPACK_SYNC_LOAD_FAIL: chunk=%d "
+                        "reason=bad_range\n",
+                        chunk_id);
+                return false;
+            }
+
+            const size_t load_size =
+                    binding->alloc_size - load_offset;
+
+            const std::string path = format(
+                    "%s/chunk-%d.bin",
+                    prepack_load_dir,
+                    chunk_id);
+
+            FILE * fp = std::fopen(path.c_str(), "rb");
+
+            if (fp != nullptr) {
+                if (std::fseek(fp, 0, SEEK_END) != 0) {
+                    std::fclose(fp);
+                    LLAMA_LOG_ERROR(
+                            "REPACK_PREPACK_SYNC_LOAD_FAIL: chunk=%d "
+                            "reason=seek_end_failed path=%s\n",
+                            chunk_id,
+                            path.c_str());
+                    return false;
+                }
+
+                const long file_size = std::ftell(fp);
+
+                if (file_size < 0 ||
+                        (size_t) file_size != load_size ||
+                        std::fseek(fp, 0, SEEK_SET) != 0) {
+                    std::fclose(fp);
+                    LLAMA_LOG_ERROR(
+                            "REPACK_PREPACK_SYNC_LOAD_FAIL: chunk=%d "
+                            "reason=size_mismatch expected=%zu actual=%ld "
+                            "path=%s\n",
+                            chunk_id,
+                            load_size,
+                            file_size,
+                            path.c_str());
+                    return false;
+                }
+
+                char * slot_base = static_cast<char *>(
+                        ggml_backend_buffer_get_base(slot));
+
+                if (slot_base == nullptr) {
+                    std::fclose(fp);
+                    LLAMA_LOG_ERROR(
+                            "REPACK_PREPACK_SYNC_LOAD_FAIL: chunk=%d "
+                            "reason=null_slot_base\n",
+                            chunk_id);
+                    return false;
+                }
+
+                const int64_t read_t0 = ggml_time_us();
+
+                const size_t nread = std::fread(
+                        slot_base + load_offset,
+                        1,
+                        load_size,
+                        fp);
+
+                const int close_rc = std::fclose(fp);
+                const int64_t read_us =
+                        ggml_time_us() - read_t0;
+
+                if (nread != load_size || close_rc != 0) {
+                    LLAMA_LOG_ERROR(
+                            "REPACK_PREPACK_SYNC_LOAD_FAIL: chunk=%d "
+                            "reason=read_failed read=%zu expected=%zu "
+                            "path=%s\n",
+                            chunk_id,
+                            nread,
+                            load_size,
+                            path.c_str());
+                    return false;
+                }
+
+                prefetched.chunk_id = chunk_id;
+                prefetched.ok = true;
+                prefetched.backend_set_done = false;
+                prefetched.prepacked_load_done = true;
+                prefetched.source_bytes = load_size;
+                prefetched.read_us = read_us;
+                prefetched.set_tensor_us = 0;
+                prefetched.total_us = read_us;
+
+                staged = true;
+
+                LLAMA_LOG_WARN(
+                        "REPACK_PREPACK_SYNC_LOAD: chunk=%d slot=%d "
+                        "offset=%zu bytes=%zu read_ms=%.3f path=%s\n",
+                        chunk_id,
+                        slot_id,
+                        load_offset,
+                        load_size,
+                        read_us / 1000.0,
+                        path.c_str());
+            } else {
+                LLAMA_LOG_WARN(
+                        "REPACK_PREPACK_SYNC_LOAD_MISS: chunk=%d path=%s "
+                        "fallback=runtime_repack\n",
+                        chunk_id,
+                        path.c_str());
+            }
+        }
+    }
+
+    std::vector<uint8_t> read_buf;
+    size_t source_bytes = 0;
+    int64_t sync_read_us = 0;
+    int64_t set_tensor_us = 0;
+
+    // This is scheduler-side latency after any future wait.  For Step 2 the
+    // expensive set_tensor/REPACK work has already happened on the worker.
+    const int64_t t0 = ggml_time_us();
+
+    if (staged &&
+            (prefetched.backend_set_done ||
+             prefetched.prepacked_load_done)) {
+        source_bytes  = prefetched.source_bytes;
+        set_tensor_us = prefetched.set_tensor_us;
+    } else {
+        try {
+            for (size_t i = 0; i < binding->tensors.size(); ++i) {
+                const auto & desc = binding->tensors[i];
+
+                if (desc.tensor == nullptr ||
+                        desc.file_idx >= pimpl->repack_files.size()) {
+                    LLAMA_LOG_ERROR(
+                            "REPACK_CHUNK_LOAD_FAIL: buft=%s chunk=%d "
+                            "reason=bad_descriptor\n",
+                            buft_name,
+                            chunk_id);
+                    return false;
+                }
+
+                if (desc.tensor->buffer != slot) {
+                    LLAMA_LOG_ERROR(
+                            "REPACK_CHUNK_LOAD_FAIL: buft=%s chunk=%d "
+                            "tensor=%s reason=slot_binding_mismatch\n",
+                            buft_name,
+                            chunk_id,
+                            ggml_get_name(desc.tensor));
+                    return false;
+                }
+
+                const void * source = nullptr;
+
+                if (staged) {
+                    const auto & buf = prefetched.tensor_data[i];
+
+                    if (buf.size() != desc.source_nbytes) {
+                        LLAMA_LOG_ERROR(
+                                "REPACK_CHUNK_LOAD_FAIL: buft=%s chunk=%d "
+                                "tensor=%s reason=staged_size_mismatch\n",
+                                buft_name,
+                                chunk_id,
+                                ggml_get_name(desc.tensor));
+                        return false;
+                    }
+
+                    source = buf.data();
+                } else {
+                    read_buf.resize(desc.source_nbytes);
+
+                    llama_file * file =
+                            pimpl->repack_files.at(desc.file_idx).get();
+
+                    const int64_t read_t0 = ggml_time_us();
+                    file->seek(desc.file_offset, SEEK_SET);
+                    file->read_raw(read_buf.data(), desc.source_nbytes);
+                    sync_read_us += ggml_time_us() - read_t0;
+
+                    source = read_buf.data();
+                }
+
+                const int64_t set_t0 = ggml_time_us();
+
+                ggml_backend_tensor_set(
+                        desc.tensor,
+                        source,
+                        0,
+                        desc.source_nbytes);
+
+                set_tensor_us += ggml_time_us() - set_t0;
+                source_bytes += desc.source_nbytes;
+            }
+        } catch (const std::exception & e) {
+            LLAMA_LOG_ERROR(
+                    "REPACK_CHUNK_LOAD_FAIL: buft=%s chunk=%d "
+                    "slot=%d error=%s\n",
+                    buft_name,
+                    chunk_id,
+                    slot_id,
+                    e.what());
+            return false;
+        }
+    }
+
+    // Optional offline-REPACK POC:
+    // After the normal backend set_tensor/REPACK path has completely
+    // materialized this logical chunk, dump the final physical HTP slot bytes.
+    //
+    // The dump excludes the slot-base alignment prefix.  On a later process
+    // invocation the same physical image can therefore be restored at that
+    // invocation's own slot_data_offset even if the slot virtual address differs.
+    const char * prepack_dump_dir =
+            std::getenv("LLAMA_REPACK_PREPACK_DUMP_DIR");
+
+    if (prepack_dump_dir != nullptr &&
+            prepack_dump_dir[0] != '\0' &&
+            binding->buft != nullptr &&
+            strstr(buft_name, "HTP") != nullptr &&
+            strstr(buft_name, "REPACK") != nullptr) {
+        const size_t dump_offset = binding->slot_data_offset;
+
+        if (binding->alloc_size < dump_offset) {
+            LLAMA_LOG_ERROR(
+                    "REPACK_PREPACK_DUMP_FAIL: chunk=%d "
+                    "reason=bad_range offset=%zu alloc=%zu\n",
+                    chunk_id,
+                    dump_offset,
+                    binding->alloc_size);
+            return false;
+        }
+
+        const size_t dump_size = binding->alloc_size - dump_offset;
+
+        const std::string final_path = format(
+                "%s/chunk-%d.bin",
+                prepack_dump_dir,
+                chunk_id);
+
+        // Each logical chunk is dumped only once.  Later graph passes reuse
+        // the existing sidecar instead of repeatedly writing it.
+        if (access(final_path.c_str(), F_OK) != 0) {
+            const std::string tmp_path = final_path + ".tmp";
+
+            char * slot_base = static_cast<char *>(
+                    ggml_backend_buffer_get_base(slot));
+
+            if (slot_base == nullptr) {
+                LLAMA_LOG_ERROR(
+                        "REPACK_PREPACK_DUMP_FAIL: chunk=%d reason=null_slot_base\n",
+                        chunk_id);
+                return false;
+            }
+
+            const int64_t dump_t0 = ggml_time_us();
+
+            FILE * fp = std::fopen(tmp_path.c_str(), "wb");
+            if (fp == nullptr) {
+                LLAMA_LOG_ERROR(
+                        "REPACK_PREPACK_DUMP_FAIL: chunk=%d path=%s "
+                        "reason=fopen\n",
+                        chunk_id,
+                        tmp_path.c_str());
+                return false;
+            }
+
+            const size_t written = std::fwrite(
+                    slot_base + dump_offset,
+                    1,
+                    dump_size,
+                    fp);
+
+            const int close_rc = std::fclose(fp);
+
+            if (written != dump_size || close_rc != 0) {
+                std::remove(tmp_path.c_str());
+
+                LLAMA_LOG_ERROR(
+                        "REPACK_PREPACK_DUMP_FAIL: chunk=%d "
+                        "written=%zu expected=%zu close_rc=%d\n",
+                        chunk_id,
+                        written,
+                        dump_size,
+                        close_rc);
+                return false;
+            }
+
+            if (std::rename(tmp_path.c_str(), final_path.c_str()) != 0) {
+                std::remove(tmp_path.c_str());
+
+                LLAMA_LOG_ERROR(
+                        "REPACK_PREPACK_DUMP_FAIL: chunk=%d path=%s "
+                        "reason=rename\n",
+                        chunk_id,
+                        final_path.c_str());
+                return false;
+            }
+
+            const int64_t dump_us = ggml_time_us() - dump_t0;
+
+            LLAMA_LOG_WARN(
+                    "REPACK_PREPACK_DUMP: chunk=%d slot=%d "
+                    "offset=%zu bytes=%zu elapsed_ms=%.3f path=%s\n",
+                    chunk_id,
+                    slot_id,
+                    dump_offset,
+                    dump_size,
+                    dump_us / 1000.0,
+                    final_path.c_str());
+        }
+    }
+
+    // Only the scheduler/main thread publishes residency.  The worker may
+    // write the idle physical slot, but it never changes residency metadata.
+    if (slot_id < 2) {
+        group->resident_chunk[slot_id] = chunk_id;
+    }
+
+    const int64_t elapsed_us = ggml_time_us() - t0;
+
+    LLAMA_LOG_WARN(
+            "REPACK_CHUNK_LOAD: buft=%s chunk=%d slot=%d tensors=%zu "
+            "source_bytes=%zu staged=%d async_backend_set=%d "
+            "prefetch_read_ms=%.3f boundary_wait_ms=%.3f "
+            "sync_read_ms=%.3f set_tensor_ms=%.3f "
+            "async_set_tensor_ms=%.3f async_total_ms=%.3f "
+            "elapsed_ms=%.3f action=reload\n",
+            buft_name,
+            chunk_id,
+            slot_id,
+            binding->tensors.size(),
+            source_bytes,
+            staged ? 1 : 0,
+            staged && prefetched.backend_set_done ? 1 : 0,
+            staged ? prefetched.read_us / 1000.0 : 0.0,
+            prefetch_wait_us / 1000.0,
+            sync_read_us / 1000.0,
+            set_tensor_us / 1000.0,
+            staged && prefetched.backend_set_done
+                    ? prefetched.set_tensor_us / 1000.0
+                    : 0.0,
+            staged ? prefetched.total_us / 1000.0 : 0.0,
+            elapsed_us / 1000.0);
+
+    return true;
 }
 
 // ===== Layer-by-layer weight offloading via madvise =====
@@ -2623,6 +3943,7 @@ llama_model_params llama_model_default_params() {
         /*.no_host                     =*/ false,
         /*.no_alloc                    =*/ false,
         /*.no_mmap_prefetch            =*/ false,
+        /*.layer_chunks                =*/ 0,
     };
 
     return result;

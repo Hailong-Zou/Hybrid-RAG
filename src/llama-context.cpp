@@ -49,6 +49,16 @@ struct llama_layer_chunk_offload {
     uint64_t prefetch_count = 0;
     int last_boundaries_found = 0;
     int last_boundaries_expected = 0;
+
+    // Diagnostic timing:
+    // previous boundary callback exit time within the same graph evaluation.
+    int64_t last_boundary_cb_exit_us = 0;
+
+    // Runtime REPACK residency uses the same synchronized graph boundaries
+    // as mmap paging, but replaces physical slot contents instead of madvise.
+    bool mmap_residency = false;
+    bool repack_residency = false;
+    bool repack_failed = false;
 };
 
 // LLAMA_LAYER_CHUNKS_ADVICE=cold -> MADV_COLD (keep weights resident, faster gen),
@@ -82,23 +92,205 @@ static bool llama_eval_cb_layer_chunk_offload(ggml_tensor * t, bool ask, void * 
             break;
         }
     }
+    const int64_t chunk_cb_entry_us =
+            c >= 1 ? ggml_time_us() : 0;
+
+    const double chunk_between_ms =
+            c >= 1 && d->last_boundary_cb_exit_us > 0
+                ? (chunk_cb_entry_us - d->last_boundary_cb_exit_us) / 1000.0
+                : 0.0;
+
     if (c >= 1 && d->model && d->layers_per_chunk > 0) {
         const int lpc = d->layers_per_chunk;
         const int n_chunks = (int) d->boundaries.size();
         d->switch_count++;
-        // evict the chunk that just finished
-        d->model->madvise_layer_weights((c-1)*lpc, c*lpc, d->evict_advice);
-        // current chunk (needed immediately)
-        d->model->madvise_layer_weights(c*lpc, (c+1)*lpc, MADV_WILLNEED);
-        // prefetch next chunk(s) DURING this chunk's compute so the flash read
-        // overlaps with the matmuls (async kernel readahead)
-        for (int k = 1; k <= d->prefetch_depth; ++k) {
-            const int nc = c + k;
-            if (nc < n_chunks) {
-                d->prefetch_count++;
-                d->model->madvise_layer_weights(nc*lpc, (nc+1)*lpc, MADV_WILLNEED);
+
+        double mmap_evict_ms = 0.0;
+        double mmap_current_willneed_ms = 0.0;
+        double mmap_ahead_willneed_ms = 0.0;
+        double repack_residency_ms = 0.0;
+
+        // mmap paging and physical REPACK residency are independent
+        // capabilities. CPU decode uses both simultaneously:
+        //   CPU_Mapped  -> madvise paging
+        //   CPU_REPACK  -> two-slot physical residency.
+        if (d->mmap_residency) {
+            int64_t t0 = ggml_time_us();
+
+            d->model->madvise_layer_weights(
+                    (c - 1)*lpc, c*lpc, d->evict_advice);
+
+            mmap_evict_ms = (ggml_time_us() - t0) / 1000.0;
+
+            t0 = ggml_time_us();
+
+            d->model->madvise_layer_weights(
+                    c*lpc, (c + 1)*lpc, MADV_WILLNEED);
+
+            mmap_current_willneed_ms =
+                    (ggml_time_us() - t0) / 1000.0;
+
+            t0 = ggml_time_us();
+
+            for (int k = 1; k <= d->prefetch_depth; ++k) {
+                const int nc = c + k;
+                if (nc < n_chunks) {
+                    d->prefetch_count++;
+                    d->model->madvise_layer_weights(
+                            nc*lpc, (nc + 1)*lpc, MADV_WILLNEED);
+                }
+            }
+
+            mmap_ahead_willneed_ms =
+                    (ggml_time_us() - t0) / 1000.0;
+        }
+
+        const int64_t repack_t0_us =
+                d->repack_residency ? ggml_time_us() : 0;
+
+        if (d->repack_residency) {
+            const bool step2_async_set =
+                    d->model->repack_async_backend_set_enabled();
+
+            if (step2_async_set) {
+                // Full async REPACK path: HTP_REPACK, or CPU_REPACK
+                // when LLAMA_REPACK_ASYNC_CPU=1.
+                //
+                // At this boundary the scheduler has synchronized HTP, so
+                // chunk c-1 has completed.  Before chunk c begins, ensure its
+                // asynchronously prepared parity slot is complete.  Then use
+                // the slot released by c-1 to prepare chunk c+1 while HTP
+                // computes chunk c in the opposite slot.
+                if (c >= 2) {
+                    if (!d->model->repack_load_chunk(c)) {
+                        d->repack_failed = true;
+
+                        LLAMA_LOG_ERROR(
+                                "REPACK_ASYNC_STEP2_WAIT_FAIL: "
+                                "current_chunk=%d\n",
+                                c);
+                        return false;
+                    }
+                }
+
+                const int next_chunk = c + 1;
+
+                // c==0 has no released previous chunk.  Chunks 0 and 1 were
+                // restored synchronously before graph execution.  The first
+                // legal Step-2 overwrite is therefore chunk2 -> slot0 at the
+                // boundary entering chunk1.
+                if (c >= 1 && next_chunk < n_chunks) {
+                    d->prefetch_count++;
+
+                    LLAMA_LOG_INFO(
+                            "REPACK_ASYNC_STEP2_RELEASE: "
+                            "finished_chunk=%d current_chunk=%d "
+                            "replacement_chunk=%d slot=%d\n",
+                            c - 1,
+                            c,
+                            next_chunk,
+                            next_chunk & 1);
+
+                    if (!d->model->repack_prefetch_chunk_async(next_chunk)) {
+                        // Correctness-first fallback: the destination slot is
+                        // already free at this boundary, so synchronous load
+                        // is safe if worker creation fails.
+                        LLAMA_LOG_WARN(
+                                "REPACK_ASYNC_STEP2_FALLBACK: chunk=%d "
+                                "action=sync_load\n",
+                                next_chunk);
+
+                        if (!d->model->repack_load_chunk(next_chunk)) {
+                            d->repack_failed = true;
+                            return false;
+                        }
+                    }
+                }
+            } else {
+                // Step 1 fallback.
+                // Synchronously materialize the next physical chunk, then
+                // pre-read the following chunk from GGUF/Flash into DRAM.
+                const int next_chunk = c + 1;
+
+                if (next_chunk < n_chunks) {
+                    d->prefetch_count++;
+
+                    LLAMA_LOG_INFO(
+                            "REPACK_CHUNK_RELEASE: finished_chunk=%d "
+                            "replacement_chunk=%d slot=%d\n",
+                            c - 1,
+                            next_chunk,
+                            next_chunk & 1);
+
+                    if (!d->model->repack_load_chunk(next_chunk)) {
+                        d->repack_failed = true;
+
+                        LLAMA_LOG_ERROR(
+                                "REPACK_CHUNK_SWITCH_FAIL: "
+                                "finished_chunk=%d next_chunk=%d\n",
+                                c - 1,
+                                next_chunk);
+
+                        return false;
+                    }
+
+                    const int prefetch_chunk = next_chunk + 1;
+
+                    if (prefetch_chunk < n_chunks) {
+                        if (!d->model->repack_prefetch_chunk_async(
+                                    prefetch_chunk)) {
+                            LLAMA_LOG_WARN(
+                                    "REPACK_ASYNC_PREFETCH_FALLBACK: "
+                                    "chunk=%d action=sync_on_demand\n",
+                                    prefetch_chunk);
+                        }
+                    }
+                }
             }
         }
+
+        if (d->repack_residency) {
+            repack_residency_ms =
+                    (ggml_time_us() - repack_t0_us) / 1000.0;
+        }
+
+        const double residency_known_ms =
+                mmap_evict_ms +
+                mmap_current_willneed_ms +
+                mmap_ahead_willneed_ms +
+                repack_residency_ms;
+
+        LLAMA_LOG_WARN(
+                "LAYER_RESIDENCY_TIMING: context=%p chunk=%d "
+                "mmap=%d repack=%d "
+                "evict_ms=%.3f current_willneed_ms=%.3f "
+                "ahead_willneed_ms=%.3f repack_ms=%.3f "
+                "known_ms=%.3f\n",
+                (void *) d,
+                c,
+                d->mmap_residency ? 1 : 0,
+                d->repack_residency ? 1 : 0,
+                mmap_evict_ms,
+                mmap_current_willneed_ms,
+                mmap_ahead_willneed_ms,
+                repack_residency_ms,
+                residency_known_ms);
+    }
+
+    if (c >= 1) {
+        const int64_t chunk_cb_exit_us = ggml_time_us();
+        const double chunk_callback_ms =
+                (chunk_cb_exit_us - chunk_cb_entry_us) / 1000.0;
+
+        LLAMA_LOG_WARN(
+                "LAYER_CHUNK_TIMING: context=%p chunk=%d "
+                "between_ms=%.3f callback_ms=%.3f\n",
+                (void *) d,
+                c,
+                chunk_between_ms,
+                chunk_callback_ms);
+
+        d->last_boundary_cb_exit_us = chunk_cb_exit_us;
     }
 
     if (d->user_cb) {
@@ -1485,6 +1677,14 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         return nullptr;
     }
 
+    if (lc_offload && lc_offload->repack_failed) {
+        LLAMA_LOG_ERROR(
+                "%s: REPACK chunk residency failed during graph execution\n",
+                __func__);
+        ret = GGML_STATUS_FAILED;
+        return nullptr;
+    }
+
     ret = GGML_STATUS_SUCCESS;
 
     return res;
@@ -1497,11 +1697,18 @@ void llama_context::setup_layer_chunk_offload() {
     const int N = cparams.layer_chunks;
     const int n_layer = model.hparams.n_layer();
 
-    const bool mmap_weights = model.supports_mmap_weight_offload();
-    const bool valid = N > 0 && n_layer > 0 && n_layer % N == 0 && mmap_weights;
+    const bool mmap_weights   = model.supports_mmap_weight_offload();
+    const bool repack_weights = model.supports_repack_chunk_residency();
+
+    const bool valid =
+            N > 0 &&
+            n_layer > 0 &&
+            n_layer % N == 0 &&
+            (mmap_weights || repack_weights);
 
     if (!valid) {
-        ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
+        ggml_backend_sched_set_eval_callback(
+                sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
         return;
     }
 
@@ -1515,8 +1722,12 @@ void llama_context::setup_layer_chunk_offload() {
     d->active_setup_count++;
     d->model         = &model;
     d->layers_per_chunk = lpc;
-    d->prefetch_depth  = 1;
-    d->evict_advice    = llama_layer_chunk_evict_advice();
+    d->prefetch_depth   = 1;
+    d->evict_advice     = llama_layer_chunk_evict_advice();
+    d->mmap_residency   = mmap_weights;
+    d->repack_residency = repack_weights;
+    d->repack_failed    = false;
+    d->last_boundary_cb_exit_us = 0;
     {
         const char * pf = getenv("LLAMA_LAYER_CHUNKS_PREFETCH");
         if (pf) {
@@ -2027,6 +2238,75 @@ int llama_context::decode(const llama_batch & batch_inp) {
         }
 
         ggml_status status;
+
+        // ---- Physical REPACK chunk residency ----
+        //
+        // The previous forward leaves the last logical chunks resident in
+        // the two parity slots. Before building/executing the next forward,
+        // restore chunk 0 and chunk 1. The boundary callback then streams
+        // chunk 2..N-1 synchronously into the slot whose previous user has
+        // already completed.
+        if (model.supports_repack_chunk_residency()) {
+            const int repack_N = cparams.layer_chunks;
+            const int repack_layers = (int) model.hparams.n_layer();
+
+            if (repack_N <= 0 ||
+                    repack_layers <= 0 ||
+                    repack_layers % repack_N != 0) {
+                LLAMA_LOG_ERROR(
+                        "%s: invalid REPACK chunk configuration: chunks=%d layers=%d\n",
+                        __func__,
+                        repack_N,
+                        repack_layers);
+                return -3;
+            }
+
+            // Previous callback-driven graph execution is synchronous at
+            // each boundary, but explicitly synchronize all scheduler
+            // backends here before replacing the slots at a new forward.
+            ggml_backend_sched_synchronize(sched.get());
+
+            if (!model.repack_load_chunk(0)) {
+                LLAMA_LOG_ERROR(
+                        "%s: failed to restore REPACK chunk 0\n",
+                        __func__);
+                return -3;
+            }
+
+            if (repack_N > 1 && !model.repack_load_chunk(1)) {
+                LLAMA_LOG_ERROR(
+                        "%s: failed to restore REPACK chunk 1\n",
+                        __func__);
+                return -3;
+            }
+
+            // Chunks 0/1 occupy the two physical parity slots.
+            //
+            // Step 1 may safely pre-read chunk2 into host DRAM now because it
+            // does not modify slot0.
+            //
+            // Step 2 must NOT set/repack chunk2 yet: chunk0 is about to use
+            // slot0.  Step-2 chunk2 is scheduled at the boundary entering
+            // chunk1, after chunk0 has completed and slot0 is free.
+            if (repack_N > 2) {
+                if (model.repack_async_backend_set_enabled()) {
+                    LLAMA_LOG_INFO(
+                            "REPACK_ASYNC_STEP2_ARMED: "
+                            "chunks=%d first_async_chunk=2\n",
+                            repack_N);
+                } else if (!model.repack_prefetch_chunk_async(2)) {
+                    LLAMA_LOG_WARN(
+                            "%s: failed to schedule initial async REPACK "
+                            "prefetch for chunk 2; falling back to sync read\n",
+                            __func__);
+                }
+            }
+
+            LLAMA_LOG_INFO(
+                    "REPACK_FORWARD_READY: chunks=%d resident=[0,%d]\n",
+                    repack_N,
+                    repack_N > 1 ? 1 : 0);
+        }
 
         // ---- Layer-chunk weight management ----
         // N chunks, each layer_chunks controls the granularity.

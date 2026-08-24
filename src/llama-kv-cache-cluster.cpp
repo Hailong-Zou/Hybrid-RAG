@@ -952,14 +952,20 @@ void llama_kv_cache_cluster::handle_split(int32_t old_cluster_id, int32_t new1_i
 // ===== SCORE-BASED TOKEN SELECTION =====
 
 std::vector<uint32_t> llama_kv_cache_cluster::select_topk_tokens(const float * query, int k_tokens,
-                                                                  const float * q_vector) {
+                                                                  const float * q_vector,
+                                                                  uint32_t current_cell_idx) {
     // Guard: if managers not initialized, return empty
     if (cluster_mgrs_.empty() || !cluster_mgrs_[0]) {
         return {};
     }
+
+    // Preserve Zhenyu's global-last behavior for existing callers; HybridRAG
+    // may explicitly provide the current sequence's last physical KV cell.
+    const uint32_t last =
+            current_cell_idx == UINT32_MAX ? get_last_cell_idx() : current_cell_idx;
+
     // Guard: if k_tokens<=0, fall back to LRU-based cluster selection
     if (k_tokens <= 0) {
-        uint32_t last = get_last_cell_idx();
         return cluster_mgrs_[0]->get_top_cluster_positions(last, get_cluster_k());
     }
 
@@ -968,7 +974,6 @@ std::vector<uint32_t> llama_kv_cache_cluster::select_topk_tokens(const float * q
     // Item 7: use real Q vector for scoring when available, otherwise use K proxy
     const float * score_query = q_vector ? q_vector : query;
 
-    uint32_t last = get_last_cell_idx();
     int32_t cur_cid = mgr.get_cluster_id(last);
 
     // Phase 1: Score resident clusters by dot product with query
@@ -1033,6 +1038,73 @@ std::vector<uint32_t> llama_kv_cache_cluster::select_topk_tokens(const float * q
     for (auto cid : selected_clusters) mgr.mark_accessed(cid);
 
     return positions;
+}
+
+
+std::vector<uint32_t> llama_kv_cache_cluster::select_positions_for_seq(llama_seq_id seq_id) {
+    if (cluster_mgrs_.empty() || !cluster_mgrs_[0] || layers.empty()) {
+        return {};
+    }
+
+    const uint32_t last = get_last_cell_idx(seq_id);
+
+    // Preserve Zhenyu's score-based selection when enabled.
+    if (cparams_.cluster_score_select && cparams_.cluster_topk_tokens > 0) {
+        auto * k0 = layers[0].k;
+        if (!k0) return {};
+
+        const size_t n_k = (size_t) k0->ne[0];
+        const size_t k_sz = ggml_type_size(k0->type);
+        std::vector<float> query(n_k);
+
+        if (k0->type == GGML_TYPE_F32) {
+            ggml_backend_tensor_get(
+                    k0, query.data(),
+                    (size_t) last * n_k * k_sz,
+                    n_k * sizeof(float));
+        } else if (k0->type == GGML_TYPE_F16) {
+            std::vector<ggml_fp16_t> tmp(n_k);
+            ggml_backend_tensor_get(
+                    k0, tmp.data(),
+                    (size_t) last * n_k * k_sz,
+                    n_k * sizeof(ggml_fp16_t));
+            for (size_t j = 0; j < n_k; ++j) {
+                query[j] = ggml_fp16_to_fp32(tmp[j]);
+            }
+        } else {
+            return {};
+        }
+
+        auto selected = select_topk_tokens(
+                query.data(), cparams_.cluster_topk_tokens, nullptr, last);
+
+        // CPU generation decode currently uses one sequence per context, so this
+        // does not alter Zhenyu's ranking in the normal path. Keep the guard for
+        // HybridRAG multi-sequence safety.
+        selected.erase(
+                std::remove_if(
+                        selected.begin(), selected.end(),
+                        [&](uint32_t pos) {
+                            return !cell_belongs_to_seq(pos, seq_id);
+                        }),
+                selected.end());
+
+        return selected;
+    }
+
+    // Preserve Zhenyu's LRU/cluster fallback, but isolate the current sequence.
+    auto selected =
+            cluster_mgrs_[0]->get_top_cluster_positions(last, get_cluster_k());
+
+    selected.erase(
+            std::remove_if(
+                    selected.begin(), selected.end(),
+                    [&](uint32_t pos) {
+                        return !cell_belongs_to_seq(pos, seq_id);
+                    }),
+            selected.end());
+
+    return selected;
 }
 
 // ===== CLUSTER VIEW =====
@@ -1286,15 +1358,9 @@ void llama_kv_cache_cluster_context::build_cluster_indices(ggml_context *, int32
     std::vector<uint32_t> needed;
 
     for (llama_seq_id seq_id : seq_ids) {
-        const uint32_t last = kv_cluster_->get_last_cell_idx(seq_id);
-        const auto selected = kv_cluster_->get_cluster_mgr(0).get_top_cluster_positions(
-                last, kv_cluster_->get_cluster_k());
-        for (uint32_t pos : selected) {
-            if (!kv_cluster_->cell_belongs_to_seq(pos, seq_id)) {
-                continue;
-            }
-            needed.push_back(pos);
-        }
+        const auto selected =
+                kv_cluster_->select_positions_for_seq(seq_id);
+        needed.insert(needed.end(), selected.begin(), selected.end());
 
         llama_pos current_pos = std::numeric_limits<llama_pos>::max();
         if (!ubatches.empty() && i_cur < ubatches.size()) {
