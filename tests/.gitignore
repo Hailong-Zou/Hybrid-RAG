@@ -5,3 +5,11 @@
 ggml-common.h
 **/*.swp
 !peg-parser
+!rag/
+!rag/run_full_pipeline_profiler.sh
+!rag/full_pipeline_profiler_device.sh
+!rag/full_pipeline_profiler.py
+!rag/compare_full_pipeline_profiler.sh
+!rag/validate_aux_npu_models.sh
+!rag/validate_aux_npu_models_device.sh
+!rag/validate_aux_npu_models.py
