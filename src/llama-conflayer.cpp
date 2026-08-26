@@ -48,8 +48,197 @@ llama_conflayer::llama_conflayer(const llama_model * model, const llama_conflaye
     set_skip_layers(skip_layers_);
 }
 
+llama_conflayer::llama_conflayer(
+        const llama_model * model,
+        llama_context * external_ctx,
+        const llama_conflayer_params & params)
+    : ctx_main_(external_ctx),
+      owns_ctx_main_(false),
+      model_(model),
+      params_(params) {
+    n_layer_ = llama_model_n_layer(model_);
+    n_vocab_ = llama_vocab_n_tokens(llama_model_get_vocab(model_));
+    n_embd_  = llama_model_n_embd(model_);
+
+    init_skip_layers();
+
+    // Keep the same initial ConFLayer state as the standalone constructor,
+    // but do not allocate a second Context.
+    set_skip_layers(skip_layers_);
+}
+
 llama_conflayer::~llama_conflayer() {
-    if (ctx_main_) llama_free(ctx_main_);
+    if (owns_ctx_main_ && ctx_main_) {
+        llama_free(ctx_main_);
+    }
+}
+
+void llama_conflayer::reset_external_request() {
+    external_evaluated_.clear();
+    external_since_opt_ = 0;
+    external_request_active_ = false;
+
+    if (!ctx_main_) {
+        draft_mode_ = false;
+        return;
+    }
+
+    // Do not trust draft_mode_ alone here. The borrowed Context survives
+    // across requests, so force-clear the actual graph mask as well.
+    llama_set_layer_skip(ctx_main_, nullptr, 0);
+    llama_set_resident_layers_ex(ctx_main_, nullptr, 0, false);
+    llama_set_intermediate_capture(ctx_main_, false);
+    draft_mode_ = false;
+
+    if (params_.cluster_attn) {
+        llama_set_cluster_full_attn(
+                ctx_main_,
+                !params_.cluster_sparse);
+    }
+}
+
+bool llama_conflayer::begin_external_request(
+        const std::vector<llama_token> & prompt,
+        llama_pos n_past) {
+    if (!ctx_main_ || params_.verify || prompt.empty()) {
+        return false;
+    }
+
+    // The current Generation handoff is pure text and restores positions
+    // [0, prompt.size()). Keep this strict so the external path cannot
+    // silently run dynamic_optimization() against a mismatched history.
+    if (n_past < 0 ||
+            n_past != static_cast<llama_pos>(prompt.size()) ||
+            prompt.size() > params_.n_ctx) {
+        return false;
+    }
+
+    reset_external_request();
+
+    n_past_ = static_cast<int32_t>(n_past);
+    new_token_num_ = 0;
+
+    // Same request-local optimization reset as the pure-skip generate() path.
+    opt_iter_        = 0;
+    lam_             = 0.0f;
+    best_score_      = 0.0f;
+    best_acc_        = 0.0f;
+    best_agree_      = 0.0f;
+    agree_sum_       = 0.0f;
+    agree_count_     = 0;
+    optimization_on_ = params_.optimize;
+    do_opt_          = true;
+    skip_layer_num_  =
+            static_cast<int32_t>(
+                    (n_layer_ - 2) * params_.skip_ratio) + 1;
+    n_opt_rounds_ = 0;
+
+    opt_set_.clear();
+    origin_score_.clear();
+    origin_acc_.clear();
+
+    skip_count_sum_ = 0;
+    skip_count_min_ = 0;
+    skip_count_max_ = 0;
+
+    opt_entropy_thresholds_.clear();
+    opt_layer_confidence_.clear();
+    opt_layer_entropy_.clear();
+    last_entropy_threshold_ = 0.0f;
+
+    // The Prompt KV is already present in ctx_main_. Re-run only the same
+    // initial full-model optimization that standalone generate() performs
+    // after Prefill; never Prefill the Prompt again.
+    if (optimization_on_) {
+        dynamic_optimization(prompt);
+
+        fprintf(stderr,
+                "CONFLAYER_EXTERNAL_OPT: phase=initial n_past=%d "
+                "evaluated=%zu opt_iter=%d skip_count=%zu skip_layers=",
+                n_past_,
+                external_evaluated_.size(),
+                opt_iter_,
+                skip_layers_.size());
+        for (size_t i = 0; i < skip_layers_.size(); ++i) {
+            fprintf(stderr, "%s%d", i ? "," : "", skip_layers_[i]);
+        }
+        fprintf(stderr, "\n");
+
+        // A successful first search advances opt_iter_. Do not silently
+        // enable the initial odd-layer skip set if the validation forward
+        // failed before producing a capped search result.
+        if (opt_iter_ == 0) {
+            reset_external_request();
+            return false;
+        }
+    }
+
+    set_draft_mode(true);
+    set_resident_active();
+
+    external_request_active_ = true;
+    return true;
+}
+
+bool llama_conflayer::advance_external_token(
+        llama_token evaluated_token) {
+    if (!external_request_active_ || !ctx_main_) {
+        return false;
+    }
+
+    // The caller invokes this after evaluating the previous pending token.
+    // Therefore the Context has advanced by exactly one position here.
+    // `evaluated_token` is already present at the old n_past_ position.
+    // Advance our bookkeeping only after that Decode has succeeded.
+    external_evaluated_.push_back(evaluated_token);
+    new_token_num_++;
+    n_past_++;
+
+    const uint32_t ns =
+            static_cast<uint32_t>(skip_layers_.size());
+    skip_count_sum_ += ns;
+    skip_count_min_ =
+            skip_count_min_
+                ? std::min(skip_count_min_, ns)
+                : ns;
+    skip_count_max_ =
+            std::max(skip_count_max_, ns);
+
+    external_since_opt_++;
+
+    if (optimization_on_ &&
+            external_since_opt_ >= params_.search_interval) {
+        // dynamic_optimization() removes [n_past_-window, n_past_) from
+        // the KV cache and re-decodes the supplied tail at those positions.
+        // Therefore the supplied tokens must be exactly the tokens already
+        // evaluated into those Context positions.
+        fprintf(stderr,
+                "CONFLAYER_EXTERNAL_OPT_TRIGGER: phase=periodic "
+                "n_past=%d evaluated=%zu since_opt=%u\n",
+                n_past_,
+                external_evaluated_.size(),
+                external_since_opt_);
+
+        dynamic_optimization(external_evaluated_);
+
+        fprintf(stderr,
+                "CONFLAYER_EXTERNAL_OPT: phase=periodic n_past=%d "
+                "evaluated=%zu opt_iter=%d skip_count=%zu skip_layers=",
+                n_past_,
+                external_evaluated_.size(),
+                opt_iter_,
+                skip_layers_.size());
+        for (size_t i = 0; i < skip_layers_.size(); ++i) {
+            fprintf(stderr, "%s%d", i ? "," : "", skip_layers_[i]);
+        }
+        fprintf(stderr, "\n");
+
+        external_since_opt_ = 0;
+        set_draft_mode(true);
+        set_resident_active();
+    }
+
+    return true;
 }
 
 void llama_conflayer::set_skip_layers(const std::vector<int32_t> & skip_layers) {

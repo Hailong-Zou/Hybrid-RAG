@@ -7,6 +7,9 @@
 #include "sampling.h"
 
 #include <cstdint>
+#include <memory>
+
+class llama_conflayer;
 
 // CPU Decode executor for the formal Generation Prefill/Decode boundary.
 //
@@ -22,9 +25,11 @@ public:
     server_generation_decode_executor(
             llama_model * model,
             llama_context_params context_params,
-            llama_seq_id sequence_id = 0);
+            llama_seq_id sequence_id = 0,
+            bool conflayer_enabled = false,
+            int32_t conflayer_max_skip_layers = 10);
 
-    ~server_generation_decode_executor() = default;
+    ~server_generation_decode_executor();
 
     server_generation_decode_executor(
             const server_generation_decode_executor &) = delete;
@@ -61,6 +66,10 @@ private:
 
     llama_context_ptr ctx_;
     common_sampler_ptr sampler_;
+
+    // Optional pure-skip controller. It borrows ctx_ and never owns or
+    // allocates another Decode Context.
+    std::unique_ptr<llama_conflayer> conflayer_;
 
     llama_seq_id sequence_id_ = -1;
     llama_pos next_position_ = -1;

@@ -1276,6 +1276,12 @@ private:
 
             common_params params_decode_cpu = params_base;
 
+            // Keep physical two-slot REPACK residency on the Prefill producer
+            // only. The dedicated CPU Decode model must remain an ordinary
+            // mmap-backed model; Decode-side ConFLayer streaming is controlled
+            // separately by decode_context_params.layer_chunks.
+            params_decode_cpu.layer_chunks = 0;
+
             // The target NPU model may require --no-mmap, but the dedicated
             // CPU decode model should use mmap to avoid duplicating the full
             // model weights in resident memory.
@@ -2153,7 +2159,9 @@ private:
                                     server_generation_decode_executor>(
                                         decode_model,
                                         decode_context_params,
-                                        0);
+                                        0,
+                                        params_base.conflayer,
+                                        params_base.conflayer_max_skip_layers);
                 }
 
                 // begin() validates and restores the sequence state,
@@ -4599,7 +4607,9 @@ private:
                                     server_generation_decode_executor>(
                                         decode_model,
                                         decode_context_params,
-                                        0);
+                                        0,
+                                        params_base.conflayer,
+                                        params_base.conflayer_max_skip_layers);
                 }
 
                 const llama_token first_token =

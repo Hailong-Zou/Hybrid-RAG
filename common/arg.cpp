@@ -2232,6 +2232,20 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_LAYER_CHUNKS"));
     add_opt(common_arg(
+        {"--conflayer"}, {"--no-conflayer"},
+        string_format("enable ConfLayers pure-skip CPU Generation Decode (default: %s)", params.conflayer ? "enabled" : "disabled"),
+        [](common_params & params, bool value) {
+            params.conflayer = value;
+        }
+    ).set_env("LLAMA_ARG_CONFLAYER"));
+    add_opt(common_arg(
+        {"--conflayer-max-skip"}, "N",
+        string_format("maximum layers skipped by ConfLayers, 0=unlimited (default: %d)", params.conflayer_max_skip_layers),
+        [](common_params & params, int value) {
+            params.conflayer_max_skip_layers = value;
+        }
+    ).set_env("LLAMA_ARG_CONFLAYER_MAX_SKIP"));
+    add_opt(common_arg(
         {"-kvo", "--kv-offload"},
         {"-nkvo", "--no-kv-offload"},
         string_format("whether to enable KV cache offloading (default: %s)", params.no_kv_offload ? "disabled" : "enabled"),

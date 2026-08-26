@@ -144,6 +144,12 @@ public:
     // Creates the internal contexts. The model is not owned by the module.
     llama_conflayer(const llama_model * model, const llama_conflayer_params & params);
 
+    // Reuse an existing Context owned by the caller. The Context is not
+    // allocated or freed by llama_conflayer.
+    llama_conflayer(const llama_model * model,
+                    llama_context * external_ctx,
+                    const llama_conflayer_params & params);
+
     ~llama_conflayer();
 
     llama_conflayer(const llama_conflayer &) = delete;
@@ -188,6 +194,27 @@ public:
 
     const llama_conflayer_params & get_params() const { return params_; }
 
+    // Attach the pure-skip lifecycle to a Context whose Prompt KV has already
+    // been restored by the caller. No Prefill is repeated here.
+    //
+    // This compatibility path intentionally mirrors generate():
+    // - the first optimization runs over the Prompt;
+    // - the skip graph is then enabled for Decode;
+    // - advance_external_token() is called once after each skip-graph Decode,
+    //   with the token that was just evaluated into the Context.
+    //
+    // Only the current pure-skip path is supported; legacy verify mode remains
+    // available to the standalone generate() path.
+    bool begin_external_request(
+            const std::vector<llama_token> & prompt,
+            llama_pos n_past);
+
+    bool advance_external_token(llama_token evaluated_token);
+
+    // Clear request-local ConFLayer state and force the borrowed Context back
+    // to the full graph. The caller still owns the Context and its KV cache.
+    void reset_external_request();
+
 private:
     // one greedy draft round (port of swift_draft)
     struct draft_round {
@@ -222,6 +249,7 @@ private:
 
     // contexts
     llama_context * ctx_main_  = nullptr; // single context: prefill, skip-graph drafting, tree verification, validation capture
+    bool owns_ctx_main_ = true;
 
     const llama_model * model_ = nullptr;
     llama_conflayer_params params_;
@@ -254,6 +282,15 @@ private:
     uint64_t skip_count_sum_ = 0;   // summed skip-set size per generated token
     uint32_t skip_count_min_ = 0;   // min skip-set size during generation
     uint32_t skip_count_max_ = 0;   // max skip-set size during generation
+
+    // State used only by the borrowed-Context server compatibility path.
+    // These are the tokens actually evaluated into the borrowed Context
+    // after the restored Prompt. This keeps dynamic_optimization() aligned
+    // with the KV positions it truncates and recomputes.
+    std::vector<llama_token> external_evaluated_;
+    uint32_t external_since_opt_ = 0;
+    bool external_request_active_ = false;
+
     std::vector<float> opt_entropy_thresholds_; // entropy threshold per layer-set update
     float    last_entropy_threshold_ = 0.0f;  // mean entropy threshold of the last search
     // per-opt-round per-layer confidence / entropy snapshots (see llama_conflayer_metrics)

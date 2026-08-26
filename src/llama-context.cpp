@@ -1838,9 +1838,6 @@ void llama_context::setup_layer_chunk_offload() {
             active.push_back(il);
         }
     }
-            active.push_back(il);
-        }
-    }
 
     if (active.empty()) {
         ggml_backend_sched_set_eval_callback(

@@ -584,6 +584,12 @@ struct common_params {
     // layer-by-layer weight offloading
     int   layer_chunks            = 0;
 
+    // ConfLayers pure-skip Generation Decode.
+    // Independent from layer_chunks so baseline/layer-only modes are unchanged
+    // unless ConfLayers is explicitly enabled.
+    bool  conflayer               = false;
+    int   conflayer_max_skip_layers = 10;
+
     bool input_prefix_bos  = false; // prefix BOS to user inputs, preceding input_prefix
     bool use_mmap          = true;  // enable mmap to use filesystem cache
     bool use_direct_io     = false; // read from disk without buffering

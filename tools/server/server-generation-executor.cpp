@@ -1,5 +1,7 @@
 #include "server-generation-executor.h"
 
+#include "llama-conflayer.h"
+
 #include <cstdio>
 #include <stdexcept>
 
@@ -27,7 +29,9 @@ server_generation_decode_executor::
 server_generation_decode_executor(
         llama_model * model,
         llama_context_params context_params,
-        llama_seq_id sequence_id)
+        llama_seq_id sequence_id,
+        bool conflayer_enabled,
+        int32_t conflayer_max_skip_layers)
     : model_(model),
       sequence_id_(sequence_id) {
     if (model_ == nullptr) {
@@ -38,6 +42,14 @@ server_generation_decode_executor(
     if (sequence_id_ < 0) {
         throw std::invalid_argument(
                 "cannot create Decode executor with an invalid sequence ID");
+    }
+
+    // ConfLayers periodically re-evaluates up to context_window=32 tokens
+    // with logits requested for every token. The ordinary CPU Decode Context
+    // only needs one output per step, so enlarge the output capacity only when
+    // ConfLayers is enabled.
+    if (conflayer_enabled && context_params.n_outputs_max < 32) {
+        context_params.n_outputs_max = 32;
     }
 
     ctx_.reset(
@@ -59,7 +71,72 @@ server_generation_decode_executor(
         throw std::invalid_argument(
                 "Decode executor sequence ID exceeds Context capacity");
     }
+
+    if (conflayer_enabled) {
+        if (sequence_id_ != 0) {
+            throw std::invalid_argument(
+                    "ConfLayers external Decode currently requires sequence ID 0");
+        }
+
+        if (conflayer_max_skip_layers < 0) {
+            throw std::invalid_argument(
+                    "ConfLayers max skip layers cannot be negative");
+        }
+
+        llama_conflayer_params conflayer_params;
+
+        // The Context itself already exists. These fields describe that same
+        // Decode configuration; the external ConFLayer path does not create
+        // another Context or perform another Prompt Prefill.
+        conflayer_params.n_ctx =
+                context_params.n_ctx;
+        conflayer_params.n_batch =
+                context_params.n_batch;
+        conflayer_params.n_ubatch =
+                context_params.n_ubatch;
+        conflayer_params.n_threads = 4;
+
+        // Preserve the current Zhenyu pure-skip search behavior. The only
+        // experiment-specific change is the requested hard cap of 10 layers
+        // (or the explicitly supplied CLI value).
+        conflayer_params.skip_ratio = 0.6f;
+        conflayer_params.max_skip_layers =
+                conflayer_max_skip_layers;
+        conflayer_params.optimize = true;
+        conflayer_params.search_interval = 25;
+        conflayer_params.context_window = 32;
+        conflayer_params.verify = false;
+
+        // Decode-side layer streaming belongs to the borrowed Context. This
+        // is independent of the Prefill producer's physical two-slot REPACK.
+        conflayer_params.layer_chunks =
+                context_params.layer_chunks;
+        conflayer_params.keep_active_resident = 0;
+
+        // Match the borrowed Context's cluster bookkeeping. Keep Zhenyu's
+        // current pure-skip default of full attention during ConFLayer phases.
+        conflayer_params.cluster_attn =
+                context_params.cluster_attn;
+        conflayer_params.cluster_sparse = false;
+
+        conflayer_ =
+                std::make_unique<llama_conflayer>(
+                        model_,
+                        ctx_.get(),
+                        conflayer_params);
+
+        fprintf(stderr,
+                "CONFLAYER_DECODE_ENABLED: max_skip_layers=%d "
+                "skip_ratio=0.600 search_interval=25 "
+                "context_window=32 layer_chunks=%d cluster_attn=%d\n",
+                conflayer_max_skip_layers,
+                context_params.layer_chunks,
+                (int) context_params.cluster_attn);
+    }
 }
+
+server_generation_decode_executor::
+~server_generation_decode_executor() = default;
 
 llama_token server_generation_decode_executor::begin(
         const server_generation_handoff & handoff) {
@@ -80,6 +157,14 @@ llama_token server_generation_decode_executor::begin(
                     ctx_.get(), sequence_id_)) {
             throw std::runtime_error(
                     "failed to rebuild cluster state after handoff restore");
+        }
+
+        if (conflayer_ &&
+                !conflayer_->begin_external_request(
+                        handoff.prompt_tokens,
+                        handoff.next_position)) {
+            throw std::runtime_error(
+                    "failed to initialize ConfLayers after Generation handoff");
         }
 
         common_params_sampling sampling_params =
@@ -130,9 +215,15 @@ llama_token server_generation_decode_executor::decode_next() {
 
     generation_batch_guard batch;
 
+    // This is the token that will actually be written into the Decode
+    // Context at next_position_. Keep it separate from the next token that
+    // will be sampled from this forward's logits.
+    const llama_token evaluated_token =
+            pending_token_;
+
     common_batch_add(
             batch.batch,
-            pending_token_,
+            evaluated_token,
             next_position_,
             { sequence_id_ },
             true);
@@ -163,11 +254,25 @@ llama_token server_generation_decode_executor::decode_next() {
     ++next_position_;
     pending_token_ = next_token;
 
+    // Run periodic full-model optimization only after next_token has already
+    // been sampled from the skip forward above. dynamic_optimization() issues
+    // its own full-model decode and therefore replaces the Context logits.
+    if (conflayer_ &&
+            !conflayer_->advance_external_token(
+                    evaluated_token)) {
+        throw std::runtime_error(
+                "ConfLayers failed to advance external Decode state");
+    }
+
     return pending_token_;
 }
 
 void server_generation_decode_executor::reset() {
     sampler_.reset();
+
+    if (conflayer_) {
+        conflayer_->reset_external_request();
+    }
 
     pending_token_ = LLAMA_TOKEN_NULL;
     next_position_ = -1;
