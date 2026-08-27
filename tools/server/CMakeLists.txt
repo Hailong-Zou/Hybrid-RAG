@@ -19,6 +19,10 @@ add_library(${TARGET} STATIC
     server-generation-handoff.h
     server-generation-executor.cpp
     server-generation-executor.h
+    server-ngram-trie.cpp
+    server-ngram-trie.h
+    server-ngram-tree.cpp
+    server-ngram-tree.h
     server-stream.cpp
     server-stream.h
     server-tools.cpp

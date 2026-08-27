@@ -241,6 +241,68 @@ bool llama_conflayer::advance_external_token(
     return true;
 }
 
+
+uint32_t llama_conflayer::external_tokens_until_optimization() const noexcept {
+    if (!external_request_active_) {
+        return 0;
+    }
+
+    if (!optimization_on_) {
+        return UINT32_MAX;
+    }
+
+    // search_interval=0 is not a meaningful periodic configuration.
+    // Treat it conservatively as a one-token boundary.
+    if (params_.search_interval == 0) {
+        return 1;
+    }
+
+    if (external_since_opt_ >= params_.search_interval) {
+        return 0;
+    }
+
+    return params_.search_interval - external_since_opt_;
+}
+
+bool llama_conflayer::advance_external_tokens(
+        const std::vector<llama_token> & evaluated_tokens) {
+    if (!external_request_active_ || !ctx_main_) {
+        return false;
+    }
+
+    if (evaluated_tokens.empty()) {
+        return true;
+    }
+
+    const uint32_t until_opt =
+            external_tokens_until_optimization();
+
+    if (until_opt != UINT32_MAX &&
+            evaluated_tokens.size() >
+                    static_cast<size_t>(until_opt)) {
+        fprintf(stderr,
+                "CONFLAYER_EXTERNAL_ADVANCE_REJECT: "
+                "tokens=%zu until_opt=%u\n",
+                evaluated_tokens.size(),
+                until_opt);
+        return false;
+    }
+
+    // Important:
+    //
+    // The speculative verifier must sample/accept next_pending BEFORE this
+    // function is called. If the final committed token reaches the periodic
+    // boundary, advance_external_token() may run dynamic_optimization(),
+    // which performs another Decode and invalidates verifier logits.
+    for (const llama_token token : evaluated_tokens) {
+        if (!advance_external_token(token)) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
 void llama_conflayer::set_skip_layers(const std::vector<int32_t> & skip_layers) {
     skip_layers_ = skip_layers;
     std::sort(skip_layers_.begin(), skip_layers_.end());

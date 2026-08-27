@@ -1,13 +1,17 @@
 #pragma once
 
 #include "server-generation-handoff.h"
+#include "server-ngram-tree.h"
+#include "server-ngram-trie.h"
 
 #include "common.h"
 #include "llama.h"
 #include "sampling.h"
 
 #include <cstdint>
+#include <deque>
 #include <memory>
+#include <vector>
 
 class llama_conflayer;
 
@@ -71,9 +75,28 @@ private:
     // allocates another Decode Context.
     std::unique_ptr<llama_conflayer> conflayer_;
 
+    // Prompt-local N-Gram draft source. It is built once from the transferred
+    // Prompt and remains static for the whole request.
+    server_ngram_trie ngram_trie_;
+    std::vector<llama_token> ngram_history_;
+    bool ngram_ready_ = false;
+
+    // Tokens already determined by one speculative verification round but
+    // not yet returned through the one-token-at-a-time server interface.
+    //
+    // The final element of every successful round is pending_token_: it has
+    // been sampled/accepted but has NOT been evaluated into KV yet.
+    std::deque<llama_token> ready_tokens_;
+
     llama_seq_id sequence_id_ = -1;
     llama_pos next_position_ = -1;
     llama_token pending_token_ = LLAMA_TOKEN_NULL;
 
     bool active_ = false;
+
+    llama_token decode_next_sequential();
+
+    // Returns true when one speculative round succeeded and ready_tokens_
+    // contains at least the next externally visible token.
+    bool try_ngram_speculative_round();
 };

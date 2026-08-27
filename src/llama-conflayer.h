@@ -211,6 +211,19 @@ public:
 
     bool advance_external_token(llama_token evaluated_token);
 
+    // Number of real generated tokens that may still be committed with the
+    // current skip-layer set before the next periodic optimization boundary.
+    //
+    // UINT32_MAX means periodic optimization is disabled.
+    uint32_t external_tokens_until_optimization() const noexcept;
+
+    // Advance request-local bookkeeping after several consecutive tokens have
+    // already been committed by one speculative verification round.
+    //
+    // The caller must never cross an optimization boundary in one call.
+    bool advance_external_tokens(
+            const std::vector<llama_token> & evaluated_tokens);
+
     // Clear request-local ConFLayer state and force the borrowed Context back
     // to the full graph. The caller still owns the Context and its KV cache.
     void reset_external_request();
