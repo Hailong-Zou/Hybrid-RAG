@@ -31,7 +31,8 @@ public:
             llama_context_params context_params,
             llama_seq_id sequence_id = 0,
             bool conflayer_enabled = false,
-            int32_t conflayer_max_skip_layers = 10);
+            int32_t conflayer_max_skip_layers = 10,
+            bool conflayer_ngram_spec_enabled = false);
 
     ~server_generation_decode_executor();
 
@@ -51,7 +52,8 @@ public:
     // Evaluate the current pending token and sample the next token.
     //
     // begin() must have completed successfully before this call.
-    llama_token decode_next();
+    llama_token decode_next(
+            int32_t remaining_output_tokens = -1);
 
     // Release request-local sampler state and clear the executor sequence.
     void reset();
@@ -74,6 +76,10 @@ private:
     // Optional pure-skip controller. It borrows ctx_ and never owns or
     // allocates another Decode Context.
     std::unique_ptr<llama_conflayer> conflayer_;
+
+    // Independent switch for N-Gram speculative decoding.
+    // OFF keeps the original sequential ConfLayers Decode path.
+    bool ngram_spec_enabled_ = false;
 
     // Prompt-local N-Gram draft source. It is built once from the transferred
     // Prompt and remains static for the whole request.
@@ -98,5 +104,6 @@ private:
 
     // Returns true when one speculative round succeeded and ready_tokens_
     // contains at least the next externally visible token.
-    bool try_ngram_speculative_round();
+    bool try_ngram_speculative_round(
+            int32_t remaining_output_tokens);
 };

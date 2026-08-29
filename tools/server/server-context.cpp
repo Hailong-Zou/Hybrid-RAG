@@ -2161,7 +2161,8 @@ private:
                                         decode_context_params,
                                         0,
                                         params_base.conflayer,
-                                        params_base.conflayer_max_skip_layers);
+                                        params_base.conflayer_max_skip_layers,
+                                        params_base.conflayer_ngram_spec);
                 }
 
                 // begin() validates and restores the sequence state,
@@ -3495,7 +3496,8 @@ private:
                             [&slot]() {
                                 return slot
                                         .generation_decode_executor
-                                        ->decode_next();
+                                        ->decode_next(
+                                                slot.n_remaining);
                             }));
         });
 
@@ -4609,7 +4611,8 @@ private:
                                         decode_context_params,
                                         0,
                                         params_base.conflayer,
-                                        params_base.conflayer_max_skip_layers);
+                                        params_base.conflayer_max_skip_layers,
+                                        params_base.conflayer_ngram_spec);
                 }
 
                 const llama_token first_token =

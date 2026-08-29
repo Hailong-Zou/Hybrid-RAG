@@ -589,6 +589,7 @@ struct common_params {
     // unless ConfLayers is explicitly enabled.
     bool  conflayer               = false;
     int   conflayer_max_skip_layers = 10;
+    bool  conflayer_ngram_spec      = false;
 
     bool input_prefix_bos  = false; // prefix BOS to user inputs, preceding input_prefix
     bool use_mmap          = true;  // enable mmap to use filesystem cache

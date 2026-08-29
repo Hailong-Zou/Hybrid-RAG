@@ -2246,6 +2246,15 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_CONFLAYER_MAX_SKIP"));
     add_opt(common_arg(
+        {"--conflayer-ngram-spec"}, {"--no-conflayer-ngram-spec"},
+        string_format(
+            "enable N-Gram speculative decoding on top of ConfLayers (default: %s)",
+            params.conflayer_ngram_spec ? "enabled" : "disabled"),
+        [](common_params & params, bool value) {
+            params.conflayer_ngram_spec = value;
+        }
+    ).set_env("LLAMA_ARG_CONFLAYER_NGRAM_SPEC"));
+    add_opt(common_arg(
         {"-kvo", "--kv-offload"},
         {"-nkvo", "--no-kv-offload"},
         string_format("whether to enable KV cache offloading (default: %s)", params.no_kv_offload ? "disabled" : "enabled"),
