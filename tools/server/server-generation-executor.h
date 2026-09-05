@@ -7,6 +7,7 @@
 #include "common.h"
 #include "llama.h"
 #include "sampling.h"
+#include "speculative.h"
 
 #include <cstdint>
 #include <deque>
@@ -80,12 +81,19 @@ private:
     // Independent switch for N-Gram speculative decoding.
     // OFF keeps the original sequential ConfLayers Decode path.
     bool ngram_spec_enabled_ = false;
+    bool ngram_native_framework_ = true;
 
     // Prompt-local N-Gram draft source. It is built once from the transferred
     // Prompt and remains static for the whole request.
     server_ngram_trie ngram_trie_;
     std::vector<llama_token> ngram_history_;
     bool ngram_ready_ = false;
+
+    common_speculative_ptr ngram_native_spec_;
+    llama_tokens ngram_native_draft_;
+    uint32_t ngram_last_matched_prefix_ = 0;
+    uint32_t ngram_last_draft_frequency_ = 0;
+    size_t ngram_last_suffix_count_ = 0;
 
     // Tokens already determined by one speculative verification round but
     // not yet returned through the one-token-at-a-time server interface.
@@ -109,4 +117,9 @@ private:
 
     bool try_ngram_tree_speculative_round(
             int32_t remaining_output_tokens);
+
+    void draft_ngram_linear_native(
+            llama_seq_id seq_id,
+            const common_speculative_draft_params & params,
+            llama_tokens & result);
 };

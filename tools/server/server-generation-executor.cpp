@@ -209,6 +209,71 @@ bool ngram_diag_compare_seq_batch_enabled() {
             std::strcmp(value, "1") == 0;
 }
 
+bool ngram_native_framework_enabled() {
+    const char * path =
+            std::getenv("LLAMA_NGRAM_NATIVE_FRAMEWORK_FILE");
+
+    char file_value[16] = {};
+
+    if (path != nullptr &&
+            path[0] != '\0') {
+        FILE * fp = std::fopen(
+                path,
+                "r");
+
+        if (fp != nullptr) {
+            const int rc =
+                    std::fscanf(
+                            fp,
+                            "%15s",
+                            file_value);
+
+            std::fclose(fp);
+
+            if (rc == 1) {
+                if (std::strcmp(file_value, "native") == 0 ||
+                        std::strcmp(file_value, "1") == 0) {
+                    return true;
+                }
+
+                if (std::strcmp(file_value, "custom") == 0 ||
+                        std::strcmp(file_value, "0") == 0) {
+                    return false;
+                }
+            }
+
+            fprintf(
+                    stderr,
+                    "NGRAM_NATIVE_FRAMEWORK_WARNING: "
+                    "invalid file %s, falling back to environment\n",
+                    path);
+        }
+    }
+
+    const char * value =
+            std::getenv("LLAMA_NGRAM_NATIVE_FRAMEWORK");
+
+    if (value == nullptr ||
+            value[0] == '\0' ||
+            std::strcmp(value, "native") == 0 ||
+            std::strcmp(value, "1") == 0) {
+        return true;
+    }
+
+    if (std::strcmp(value, "custom") == 0 ||
+            std::strcmp(value, "0") == 0) {
+        return false;
+    }
+
+    fprintf(
+            stderr,
+            "NGRAM_NATIVE_FRAMEWORK_WARNING: "
+            "invalid LLAMA_NGRAM_NATIVE_FRAMEWORK=%s, using native\n",
+            value);
+
+    return true;
+}
+
 uint64_t ngram_diag_history_hash(
         const std::vector<llama_token> & history) {
     // FNV-1a over the exact token-id byte sequence.
@@ -680,6 +745,9 @@ llama_token server_generation_decode_executor::begin(
         ngram_ready_ = false;
 
         if (conflayer_ && ngram_spec_enabled_) {
+            ngram_native_framework_ =
+                    ngram_native_framework_enabled();
+
             const llama_vocab * vocab =
                     llama_model_get_vocab(model_);
 
@@ -739,6 +807,39 @@ llama_token server_generation_decode_executor::begin(
                     ngram_history_.size(),
                     ngram_trie_.entry_count(),
                     ngram_trie_.node_count());
+
+            if (ngram_native_framework_) {
+                common_speculative_external external;
+                external.name = "ngram-trie";
+                external.draft = [this](
+                        llama_seq_id seq_id,
+                        const common_speculative_draft_params & params,
+                        llama_tokens & result) {
+                    draft_ngram_linear_native(
+                            seq_id,
+                            params,
+                            result);
+                };
+
+                ngram_native_spec_.reset(
+                        common_speculative_init_external(
+                                std::move(external),
+                                1));
+
+                common_speculative_begin(
+                        ngram_native_spec_.get(),
+                        sequence_id_,
+                        ngram_history_);
+            }
+
+            fprintf(stderr,
+                    "NGRAM_LINEAR_FRAMEWORK: mode=%s "
+                    "draft=%s sampler=%s verifier=linear\n",
+                    ngram_native_framework_ ? "native" : "custom",
+                    ngram_native_framework_ ?
+                            "common_speculative" : "direct_trie",
+                    ngram_native_framework_ ?
+                            "sample_and_accept_n" : "per_row");
 
             if (ngram_diag_force_seq_enabled()) {
                 fprintf(stderr,
@@ -911,6 +1012,78 @@ server_generation_decode_executor::decode_next_sequential() {
     return pending_token_;
 }
 
+void
+server_generation_decode_executor::
+draft_ngram_linear_native(
+        llama_seq_id seq_id,
+        const common_speculative_draft_params & params,
+        llama_tokens & result) {
+    result.clear();
+    ngram_last_matched_prefix_ = 0;
+    ngram_last_draft_frequency_ = 0;
+    ngram_last_suffix_count_ = 0;
+
+    if (!ngram_ready_ ||
+            seq_id != sequence_id_ ||
+            params.prompt == nullptr ||
+            params.id_last == LLAMA_TOKEN_NULL) {
+        return;
+    }
+
+    const auto lookup =
+            ngram_trie_.lookup(
+                    *params.prompt,
+                    params.id_last);
+
+    ngram_last_matched_prefix_ =
+            lookup.matched_prefix_length;
+    ngram_last_suffix_count_ =
+            lookup.suffixes.size();
+
+    const server_ngram_suffix * selected_suffix = nullptr;
+
+    for (const auto & suffix : lookup.suffixes) {
+        if (!suffix.tokens.empty() &&
+                suffix.frequency > 0) {
+            selected_suffix = &suffix;
+            break;
+        }
+    }
+
+    if (selected_suffix == nullptr) {
+        return;
+    }
+
+    ngram_last_draft_frequency_ =
+            selected_suffix->frequency;
+
+    const llama_vocab * vocab =
+            llama_model_get_vocab(model_);
+
+    if (vocab == nullptr) {
+        return;
+    }
+
+    size_t n_max = selected_suffix->tokens.size();
+    if (params.n_max >= 0) {
+        n_max = std::min(
+                n_max,
+                static_cast<size_t>(params.n_max));
+    }
+
+    result.reserve(n_max);
+
+    for (const llama_token token : selected_suffix->tokens) {
+        if (result.size() >= n_max ||
+                token == LLAMA_TOKEN_NULL ||
+                llama_vocab_is_eog(vocab, token)) {
+            break;
+        }
+
+        result.push_back(token);
+    }
+}
+
 bool
 server_generation_decode_executor::
 try_ngram_speculative_round(
@@ -934,19 +1107,6 @@ try_ngram_speculative_round(
         return false;
     }
 
-    const auto lookup =
-            ngram_trie_.lookup(
-                    ngram_history_,
-                    pending_token_);
-
-    if (lookup.suffixes.empty()) {
-        fprintf(stderr,
-                "NGRAM_SPEC_MISS: position=%d history=%zu\n",
-                (int) next_position_,
-                ngram_history_.size());
-        return false;
-    }
-
     const llama_vocab * vocab =
             llama_model_get_vocab(model_);
 
@@ -955,34 +1115,9 @@ try_ngram_speculative_round(
                 "N-Gram verification has no vocabulary");
     }
 
-    // lookup.suffixes is already sorted frequency-first by the Trie.
-    // Select the highest-frequency non-empty continuation as the draft path.
-    const server_ngram_suffix * selected_suffix = nullptr;
-
-    for (const auto & suffix :
-            lookup.suffixes) {
-        if (!suffix.tokens.empty() &&
-                suffix.frequency > 0) {
-            selected_suffix = &suffix;
-            break;
-        }
-    }
-
-    if (selected_suffix == nullptr) {
-        return false;
-    }
-
     constexpr size_t NGRAM_MAX_DRAFT_TOKENS = 3;
 
-    const size_t suffix_depth =
-            static_cast<size_t>(
-                    ngram_trie_.ngram_size() -
-                    ngram_trie_.prefix_length());
-
-    size_t max_depth =
-            std::min(
-                    suffix_depth,
-                    NGRAM_MAX_DRAFT_TOKENS);
+    size_t max_depth = NGRAM_MAX_DRAFT_TOKENS;
 
     // remaining_output_tokens counts externally visible tokens that the
     // server may still return for this request.
@@ -1071,31 +1206,54 @@ try_ngram_speculative_round(
         return false;
     }
 
-    std::vector<llama_token> draft_tokens;
-    draft_tokens.reserve(max_depth);
+    llama_tokens custom_draft;
+    llama_tokens * draft_result =
+            ngram_native_framework_ ?
+            &ngram_native_draft_ :
+            &custom_draft;
 
-    for (const llama_token token :
-            selected_suffix->tokens) {
-        if (draft_tokens.size() >= max_depth) {
-            break;
+    draft_result->clear();
+
+    const common_speculative_draft_params draft_params = {
+        /* .drafting = */ true,
+        /* .n_max    = */ static_cast<int32_t>(max_depth),
+        /* .n_past   = */ next_position_,
+        /* .id_last  = */ pending_token_,
+        /* .prompt   = */ &ngram_history_,
+        /* .result   = */ draft_result,
+    };
+
+    if (ngram_native_framework_) {
+        if (!ngram_native_spec_) {
+            return false;
         }
 
-        if (token == LLAMA_TOKEN_NULL ||
-                llama_vocab_is_eog(
-                        vocab,
-                        token)) {
-            // EOG is never speculatively evaluated into KV. If the verifier
-            // predicts it, it becomes next_pending exactly like sequential
-            // Decode.
-            break;
-        }
+        common_speculative_get_draft_params(
+                ngram_native_spec_.get(),
+                sequence_id_) = draft_params;
 
-        draft_tokens.push_back(token);
+        common_speculative_draft(
+                ngram_native_spec_.get());
+    } else {
+        draft_ngram_linear_native(
+                sequence_id_,
+                draft_params,
+                *draft_result);
     }
 
-    if (draft_tokens.empty()) {
+    if (draft_result->empty()) {
+        fprintf(stderr,
+                "NGRAM_SPEC_MISS: position=%d history=%zu "
+                "matched_prefix=%u suffixes=%zu\n",
+                (int) next_position_,
+                ngram_history_.size(),
+                ngram_last_matched_prefix_,
+                ngram_last_suffix_count_);
         return false;
     }
+
+    const llama_tokens & draft_tokens =
+            *draft_result;
 
     llama_memory_t mem =
             llama_get_memory(ctx_.get());
@@ -1274,11 +1432,8 @@ try_ngram_speculative_round(
         }
 
         std::vector<llama_token> committed;
-        std::vector<llama_token> produced;
 
         committed.reserve(
-                draft_tokens.size() + 1);
-        produced.reserve(
                 draft_tokens.size() + 1);
 
         // pending_token_ was already sampled/accepted by the live sampler in
@@ -1286,15 +1441,10 @@ try_ngram_speculative_round(
         committed.push_back(
                 pending_token_);
 
-        llama_token next_pending =
-                LLAMA_TOKEN_NULL;
-
-        size_t accepted_draft = 0;
-
-        for (size_t row = 0;
-                row < batch_tokens.size();
-                ++row) {
-            if (ngram_diag_enabled()) {
+        if (ngram_diag_enabled()) {
+            for (size_t row = 0;
+                    row < batch_tokens.size();
+                    ++row) {
                 std::vector<llama_token> diag_history =
                         ngram_history_;
 
@@ -1314,14 +1464,89 @@ try_ngram_speculative_round(
                         llama_vocab_n_tokens(vocab),
                         diag_history);
             }
+        }
 
-            const llama_token sampled =
-                    common_sampler_sample(
+        std::vector<llama_token> produced;
+        size_t accepted_draft = 0;
+        llama_token next_pending =
+                LLAMA_TOKEN_NULL;
+
+        produced.reserve(
+                draft_tokens.size() + 1);
+
+        if (ngram_native_framework_) {
+            std::vector<int> spec_i_batch(
+                    batch_tokens.size());
+
+            for (size_t i = 0;
+                    i < spec_i_batch.size();
+                    ++i) {
+                spec_i_batch[i] =
+                        static_cast<int>(i);
+            }
+
+            produced =
+                    common_sampler_sample_and_accept_n(
                             sampler_work.get(),
                             ctx_.get(),
-                            static_cast<int32_t>(row));
+                            spec_i_batch,
+                            draft_tokens);
 
-            if (ngram_diag_enabled()) {
+            while (accepted_draft < draft_tokens.size() &&
+                    accepted_draft < produced.size() &&
+                    produced[accepted_draft] ==
+                            draft_tokens[accepted_draft]) {
+                committed.push_back(
+                        produced[accepted_draft]);
+                ++accepted_draft;
+            }
+
+            if (!produced.empty()) {
+                next_pending =
+                        produced.back();
+            }
+        } else {
+            for (size_t row = 0;
+                    row < batch_tokens.size();
+                    ++row) {
+                const llama_token sampled =
+                        common_sampler_sample(
+                                sampler_work.get(),
+                                ctx_.get(),
+                                static_cast<int32_t>(row));
+
+                common_sampler_accept(
+                        sampler_work.get(),
+                        sampled,
+                        true);
+
+                produced.push_back(
+                        sampled);
+
+                if (llama_vocab_is_eog(
+                            vocab,
+                            sampled)) {
+                    next_pending = sampled;
+                    break;
+                }
+
+                if (row < draft_tokens.size() &&
+                        sampled == draft_tokens[row]) {
+                    committed.push_back(
+                            sampled);
+                    ++accepted_draft;
+                    continue;
+                }
+
+                next_pending = sampled;
+                break;
+            }
+        }
+
+        if (ngram_diag_enabled()) {
+            for (size_t row = 0;
+                    row < produced.size();
+                    ++row) {
                 fprintf(stderr,
                         "NGRAM_DIAG_LINEAR_SAMPLE: "
                         "position=%d row=%zu "
@@ -1331,38 +1556,8 @@ try_ngram_speculative_round(
                                 static_cast<llama_pos>(row)),
                         row,
                         (int) batch_tokens[row],
-                        (int) sampled);
+                        (int) produced[row]);
             }
-
-            common_sampler_accept(
-                    sampler_work.get(),
-                    sampled,
-                    true);
-
-            produced.push_back(
-                    sampled);
-
-            if (llama_vocab_is_eog(
-                        vocab,
-                        sampled)) {
-                next_pending = sampled;
-                break;
-            }
-
-            // row i predicts draft_tokens[i].
-            //
-            // When row == draft_tokens.size(), every draft token has already
-            // matched and this row supplies the next normal pending token.
-            if (row < draft_tokens.size() &&
-                    sampled == draft_tokens[row]) {
-                committed.push_back(
-                        sampled);
-                ++accepted_draft;
-                continue;
-            }
-
-            next_pending = sampled;
-            break;
         }
 
         if (next_pending == LLAMA_TOKEN_NULL ||
@@ -1413,6 +1608,13 @@ try_ngram_speculative_round(
                 std::move(
                         sampler_work);
 
+        if (ngram_native_framework_) {
+            common_speculative_accept(
+                    ngram_native_spec_.get(),
+                    sequence_id_,
+                    static_cast<uint16_t>(accepted_draft));
+        }
+
         ready_tokens_.clear();
 
         for (const llama_token token :
@@ -1422,16 +1624,17 @@ try_ngram_speculative_round(
         }
 
         fprintf(stderr,
-                "NGRAM_SPEC_ROUND: mode=linear "
+                "NGRAM_SPEC_ROUND: mode=linear framework=%s "
                 "position=%d matched_prefix=%u "
                 "suffixes=%zu draft_frequency=%u "
                 "draft_len=%zu evaluated=%zu "
                 "accepted_draft=%zu committed=%zu "
                 "queued=%zu until_opt=%u remaining=%d\n",
+                ngram_native_framework_ ? "native" : "custom",
                 (int) round_start,
-                lookup.matched_prefix_length,
-                lookup.suffixes.size(),
-                selected_suffix->frequency,
+                ngram_last_matched_prefix_,
+                ngram_last_suffix_count_,
+                ngram_last_draft_frequency_,
                 draft_tokens.size(),
                 batch_tokens.size(),
                 accepted_draft,
@@ -1958,6 +2161,16 @@ try_ngram_tree_speculative_round(
 
 void server_generation_decode_executor::reset() {
     ready_tokens_.clear();
+    if (ngram_native_spec_) {
+        common_speculative_print_stats(
+                ngram_native_spec_.get());
+    }
+    ngram_native_spec_.reset();
+    ngram_native_draft_.clear();
+    ngram_last_matched_prefix_ = 0;
+    ngram_last_draft_frequency_ = 0;
+    ngram_last_suffix_count_ = 0;
+    ngram_native_framework_ = true;
     ngram_history_.clear();
     ngram_trie_.clear();
     ngram_ready_ = false;

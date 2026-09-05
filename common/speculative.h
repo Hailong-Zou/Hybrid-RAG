@@ -3,6 +3,8 @@
 #include "llama.h"
 #include "common.h"
 
+#include <functional>
+
 struct common_speculative;
 
 // comma separated list the provided types
@@ -49,6 +51,22 @@ struct common_speculative_draft_params {
     // the generated draft from the last _draft() call
     llama_tokens * result;
 };
+
+struct common_speculative_external {
+    std::string name;
+
+    std::function<void(llama_seq_id, const llama_tokens &)> begin;
+    std::function<bool(const llama_batch &)> process;
+    std::function<void(llama_seq_id, const common_speculative_draft_params &, llama_tokens &)> draft;
+    std::function<void(llama_seq_id, uint16_t, bool)> accept;
+
+    bool need_embd = false;
+    bool need_embd_nextn = false;
+};
+
+common_speculative * common_speculative_init_external(
+        common_speculative_external callbacks,
+        uint32_t n_seq);
 
 common_speculative_draft_params & common_speculative_get_draft_params(common_speculative * spec, llama_seq_id seq_id);
 

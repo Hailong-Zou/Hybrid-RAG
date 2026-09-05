@@ -134,6 +134,7 @@ using common_speculative_draft_params_vec = std::vector<common_speculative_draft
 // in a subclass of common_speculative_impl
 struct common_speculative_impl {
     const common_speculative_type type;
+    const std::string name;
 
     uint32_t n_seq;
 
@@ -155,7 +156,8 @@ struct common_speculative_impl {
     int64_t t_draft_us  = 0; // total time spent in generating drafts in this implementation in microseconds.
     int64_t t_accept_us = 0; // total time spent in accumulation of this implementation in microseconds.
 
-    common_speculative_impl(common_speculative_type type, uint32_t n_seq) : type(type), n_seq(n_seq) {}
+    common_speculative_impl(common_speculative_type type, uint32_t n_seq, std::string name = {})
+        : type(type), name(std::move(name)), n_seq(n_seq) {}
 
     virtual ~common_speculative_impl() = default;
 
@@ -176,6 +178,55 @@ struct common_speculative_impl {
 
     // true if this implementation requires the target context to extract pre-norm embeddings
     virtual bool need_embd_nextn() const { return false; }
+};
+
+static std::string common_speculative_impl_name(const common_speculative_impl & impl) {
+    return impl.name.empty() ? common_speculative_type_to_str(impl.type) : impl.name;
+}
+
+struct common_speculative_impl_external : public common_speculative_impl {
+    common_speculative_external callbacks;
+
+    common_speculative_impl_external(common_speculative_external callbacks, uint32_t n_seq)
+        : common_speculative_impl(COMMON_SPECULATIVE_TYPE_NONE, n_seq, callbacks.name)
+        , callbacks(std::move(callbacks)) {
+        if (!this->callbacks.draft) {
+            throw std::invalid_argument("external speculative implementation requires a draft callback");
+        }
+    }
+
+    void begin(llama_seq_id seq_id, const llama_tokens & prompt) override {
+        if (callbacks.begin) {
+            callbacks.begin(seq_id, prompt);
+        }
+    }
+
+    bool process(const llama_batch & batch) override {
+        return callbacks.process ? callbacks.process(batch) : true;
+    }
+
+    void draft(common_speculative_draft_params_vec & dparams) override {
+        for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+            auto & dp = dparams[seq_id];
+            if (dp.drafting) {
+                callbacks.draft(seq_id, dp, *dp.result);
+            }
+        }
+    }
+
+    void accept(llama_seq_id seq_id, uint16_t n_accepted, bool is_other) override {
+        if (callbacks.accept) {
+            callbacks.accept(seq_id, n_accepted, is_other);
+        }
+    }
+
+    bool need_embd() const override {
+        return callbacks.need_embd;
+    }
+
+    bool need_embd_nextn() const override {
+        return callbacks.need_embd_nextn;
+    }
 };
 
 struct common_speculative_impl_draft_simple : public common_speculative_impl {
@@ -2471,6 +2522,23 @@ common_speculative * common_speculative_init(common_params_speculative & params,
     return result;
 }
 
+common_speculative * common_speculative_init_external(
+        common_speculative_external callbacks,
+        uint32_t n_seq) {
+    if (n_seq == 0) {
+        throw std::invalid_argument("external speculative implementation requires at least one sequence");
+    }
+
+    std::vector<std::unique_ptr<common_speculative_impl>> impls;
+    impls.push_back(std::make_unique<common_speculative_impl_external>(std::move(callbacks), n_seq));
+
+    return new common_speculative {
+        /* .dparams   = */ common_speculative_draft_params_vec(n_seq),
+        /* .impls     = */ std::move(impls),
+        /* .impl_last = */ std::vector<common_speculative_impl *>(n_seq, nullptr),
+    };
+}
+
 void common_speculative_free(common_speculative * spec) {
     if (spec == nullptr) {
         return;
@@ -2592,7 +2660,7 @@ void common_speculative_draft(common_speculative * spec) {
 
                 if (!result.empty()) {
                     SPC_DBG("called impl %s, hist size = %zu, call_count = %zu, gen = %zu\n",
-                            common_speculative_type_to_str(impl.get()->type).c_str(), dp.prompt->size(),
+                            common_speculative_impl_name(*impl).c_str(), dp.prompt->size(),
                             impl.get()->n_call_draft, result.size());
 
                     // remember which implementation was used
@@ -2716,7 +2784,7 @@ void common_speculative_print_stats(const common_speculative * spec) {
         }
 
         SPC_TRC("statistics %16s: #calls(b,g,a) = %4zu %6zu %6zu, #gen drafts = %6zu, #acc drafts = %5zu, #gen tokens = %6zu, #acc tokens = %5zu%s%s\n",
-                common_speculative_type_to_str(impl->type).c_str(),
+                common_speculative_impl_name(*impl).c_str(),
                 impl->n_call_begin, impl->n_call_draft, impl->n_call_accept,
                 impl->n_gen_drafts,
                 impl->n_acc_drafts,
