@@ -45,6 +45,154 @@ bool ngram_diag_enabled() {
             std::strcmp(value, "1") == 0;
 }
 
+bool ngram_diag_tree_enabled() {
+    const char * value =
+            std::getenv("LLAMA_NGRAM_DIAG_TREE");
+
+    return value != nullptr &&
+            std::strcmp(value, "1") == 0;
+}
+
+
+
+size_t ngram_tree_env_size(
+        const char * name,
+        size_t default_value,
+        size_t min_value,
+        size_t max_value) {
+    const char * value = std::getenv(name);
+
+    if (value == nullptr ||
+            value[0] == '\0') {
+        return default_value;
+    }
+
+    char * end = nullptr;
+
+    const long parsed =
+            std::strtol(
+                    value,
+                    &end,
+                    10);
+
+    if (end == value ||
+            *end != '\0' ||
+            parsed < static_cast<long>(min_value) ||
+            parsed > static_cast<long>(max_value)) {
+        fprintf(
+                stderr,
+                "NGRAM_TREE_CONFIG_WARNING: "
+                "%s=%s invalid, using %zu\n",
+                name,
+                value,
+                default_value);
+
+        return default_value;
+    }
+
+    return static_cast<size_t>(parsed);
+}
+
+size_t ngram_tree_runtime_size(
+        const char * env_name,
+        const char * file_env_name,
+        size_t default_value,
+        size_t min_value,
+        size_t max_value) {
+    const char * path =
+            std::getenv(file_env_name);
+
+    if (path != nullptr &&
+            path[0] != '\0') {
+        FILE * fp = std::fopen(
+                path,
+                "r");
+
+        if (fp != nullptr) {
+            long parsed = 0;
+
+            const int rc =
+                    std::fscanf(
+                            fp,
+                            "%ld",
+                            &parsed);
+
+            std::fclose(fp);
+
+            if (rc == 1 &&
+                    parsed >=
+                            static_cast<long>(
+                                    min_value) &&
+                    parsed <=
+                            static_cast<long>(
+                                    max_value)) {
+                return static_cast<size_t>(
+                        parsed);
+            }
+
+            fprintf(
+                    stderr,
+                    "NGRAM_TREE_CONFIG_WARNING: "
+                    "invalid file %s, "
+                    "falling back to %s\n",
+                    path,
+                    env_name);
+        }
+    }
+
+    return ngram_tree_env_size(
+            env_name,
+            default_value,
+            min_value,
+            max_value);
+}
+
+size_t ngram_tree_max_branches() {
+    return ngram_tree_runtime_size(
+            "LLAMA_NGRAM_TREE_MAX_BRANCHES",
+            "LLAMA_NGRAM_TREE_MAX_BRANCHES_FILE",
+            3,
+            1,
+            8);
+}
+
+size_t ngram_tree_max_draft() {
+    return ngram_tree_runtime_size(
+            "LLAMA_NGRAM_TREE_MAX_DRAFT",
+            "LLAMA_NGRAM_TREE_MAX_DRAFT_FILE",
+            3,
+            1,
+            8);
+}
+
+
+size_t ngram_runtime_size() {
+    return ngram_tree_runtime_size(
+            "LLAMA_NGRAM_SIZE",
+            "LLAMA_NGRAM_SIZE_FILE",
+            13,
+            2,
+            32);
+}
+
+size_t ngram_runtime_prefix_length() {
+    return ngram_tree_runtime_size(
+            "LLAMA_NGRAM_PREFIX_LENGTH",
+            "LLAMA_NGRAM_PREFIX_LENGTH_FILE",
+            3,
+            1,
+            16);
+}
+
+size_t ngram_tree_min_prefix_length() {
+    return ngram_tree_runtime_size(
+            "LLAMA_NGRAM_TREE_MIN_PREFIX_LENGTH",
+            "LLAMA_NGRAM_TREE_MIN_PREFIX_LENGTH_FILE",
+            1,
+            1,
+            16);
+}
+
 bool ngram_diag_force_seq_enabled() {
     const char * value =
             std::getenv("LLAMA_NGRAM_DIAG_FORCE_SEQ");
@@ -242,7 +390,118 @@ server_generation_decode_executor(
     // Keeping n_seq_max == 1 avoids changing the authoritative ConfLayers
     // Decode graph merely because speculative decoding is enabled.
     if (ngram_spec_enabled_) {
-        context_params.n_seq_max = 1;
+        if (ngram_diag_tree_enabled()) {
+            const size_t tree_max_branches =
+                    ngram_tree_max_branches();
+
+            const size_t tree_max_draft =
+                    ngram_tree_max_draft();
+
+            // seq0 = committed history.
+            // seq1..N = temporary candidate leaves.
+            context_params.n_seq_max =
+                    static_cast<uint32_t>(
+                            tree_max_branches + 1);
+
+            context_params.kv_unified = true;
+
+            // Keep at least 32 output rows for ConfLayer optimization.
+            // Tree verification itself needs at most:
+            //
+            //   root + branches * draft
+            //
+            const uint32_t tree_outputs =
+                    static_cast<uint32_t>(
+                            1 +
+                            tree_max_branches *
+                            tree_max_draft);
+
+            const uint32_t required_outputs =
+                    std::max<uint32_t>(
+                            32,
+                            tree_outputs);
+
+            if (context_params.n_outputs_max <
+                    required_outputs) {
+                context_params.n_outputs_max =
+                        required_outputs;
+            }
+
+            fprintf(
+                    stderr,
+                    "NGRAM_TREE_CONFIG: "
+                    "branches=%zu draft=%zu "
+                    "n_seq_max=%u max_nodes=%u\n",
+                    tree_max_branches,
+                    tree_max_draft,
+                    context_params.n_seq_max,
+                    tree_outputs);
+        } else {
+            context_params.n_seq_max = 1;
+        }
+    }
+
+    // Diagnostic-only Context-shape overrides for isolating the old
+    // multi-sequence verification-tree correctness issue.
+    //
+    // These variables are intentionally independent so we can run the 2x2:
+    //
+    //   n_seq_max = 1 / 32
+    //   kv_unified = false / true
+    //
+    // with N-Gram and the verification tree both disabled.
+    const char * nseq_diag_max =
+            std::getenv("LLAMA_NSEQ_DIAG_MAX");
+
+    if (nseq_diag_max != nullptr &&
+            nseq_diag_max[0] != '\0') {
+        char * end = nullptr;
+        const long value =
+                std::strtol(
+                        nseq_diag_max,
+                        &end,
+                        10);
+
+        if (end == nseq_diag_max ||
+                *end != '\0' ||
+                (value != 1 && value != 32)) {
+            throw std::invalid_argument(
+                    "LLAMA_NSEQ_DIAG_MAX must be 1 or 32");
+        }
+
+        context_params.n_seq_max =
+                static_cast<uint32_t>(value);
+    }
+
+    const char * nseq_diag_unified =
+            std::getenv("LLAMA_NSEQ_DIAG_UNIFIED");
+
+    if (nseq_diag_unified != nullptr &&
+            nseq_diag_unified[0] != '\0') {
+        if (std::strcmp(
+                    nseq_diag_unified,
+                    "0") == 0) {
+            context_params.kv_unified = false;
+        } else if (std::strcmp(
+                       nseq_diag_unified,
+                       "1") == 0) {
+            context_params.kv_unified = true;
+        } else {
+            throw std::invalid_argument(
+                    "LLAMA_NSEQ_DIAG_UNIFIED must be 0 or 1");
+        }
+    }
+
+    if (nseq_diag_max != nullptr ||
+            nseq_diag_unified != nullptr) {
+        fprintf(stderr,
+                "NSEQ_DIAG_CONTEXT_REQUEST: "
+                "n_seq_max=%u kv_unified=%d "
+                "ngram_spec=%d conflayer=%d\n",
+                context_params.n_seq_max,
+                (int) context_params.kv_unified,
+                (int) ngram_spec_enabled_,
+                (int) conflayer_enabled);
     }
 
     ctx_.reset(
@@ -255,11 +514,34 @@ server_generation_decode_executor(
                 "failed to create CPU Decode Context");
     }
 
-    if (ngram_spec_enabled_ &&
-            llama_n_seq_max(ctx_.get()) != 1) {
-        throw std::runtime_error(
-                "N-Gram linear speculative Decode requires "
-                "a single-sequence Decode Context");
+    if (nseq_diag_max != nullptr ||
+            nseq_diag_unified != nullptr) {
+        fprintf(stderr,
+                "NSEQ_DIAG_CONTEXT_ACTUAL: "
+                "n_seq_max=%u n_ctx=%u n_ctx_seq=%u\n",
+                llama_n_seq_max(ctx_.get()),
+                llama_n_ctx(ctx_.get()),
+                llama_n_ctx_seq(ctx_.get()));
+    }
+
+    if (ngram_spec_enabled_) {
+        if (ngram_diag_tree_enabled()) {
+            const size_t required_sequences =
+                    ngram_tree_max_branches() + 1;
+
+            if (llama_n_seq_max(ctx_.get()) <
+                        required_sequences ||
+                    llama_n_ctx_seq(ctx_.get()) !=
+                            llama_n_ctx(ctx_.get())) {
+                throw std::runtime_error(
+                        "N-Gram tree diagnostic requires "
+                        "sufficient sequences and unified KV");
+            }
+        } else if (llama_n_seq_max(ctx_.get()) != 1) {
+            throw std::runtime_error(
+                    "N-Gram linear speculative Decode requires "
+                    "a single-sequence Decode Context");
+        }
     }
 
     // Match the dedicated CPU decode context to the four-thread baseline.
@@ -406,6 +688,41 @@ llama_token server_generation_decode_executor::begin(
                         "cannot initialize N-Gram Trie without vocabulary");
             }
 
+            const size_t runtime_ngram_size =
+                    ngram_runtime_size();
+
+            const size_t runtime_prefix_length =
+                    ngram_runtime_prefix_length();
+
+            const size_t runtime_min_prefix_length =
+                    ngram_tree_min_prefix_length();
+
+            if (runtime_prefix_length >= runtime_ngram_size) {
+                throw std::runtime_error(
+                        "N-Gram prefix length must be smaller than ngram size");
+            }
+
+            if (runtime_min_prefix_length >
+                    runtime_prefix_length) {
+                throw std::runtime_error(
+                        "N-Gram tree minimum prefix length must not exceed "
+                        "configured prefix length");
+            }
+
+            ngram_trie_ =
+                    server_ngram_trie(
+                            static_cast<uint32_t>(runtime_ngram_size),
+                            static_cast<uint32_t>(runtime_prefix_length),
+                            4);
+
+            fprintf(
+                    stderr,
+                    "NGRAM_TRIE_CONFIG: n=%zu prefix=%zu "
+                    "min_prefix=%zu lookup_window=4\n",
+                    runtime_ngram_size,
+                    runtime_prefix_length,
+                    runtime_min_prefix_length);
+
             ngram_ready_ =
                     ngram_trie_.build(
                             ngram_history_,
@@ -471,6 +788,27 @@ server_generation_decode_executor::decode_next(
     // same-context A/B reference for speculative verification.
     if (ngram_spec_enabled_ &&
             ngram_diag_force_seq_enabled()) {
+        return decode_next_sequential();
+    }
+
+    if (ngram_spec_enabled_ &&
+            ngram_diag_tree_enabled()) {
+        if (conflayer_ &&
+                ngram_ready_ &&
+                try_ngram_tree_speculative_round(
+                        remaining_output_tokens)) {
+            if (ready_tokens_.empty()) {
+                throw std::logic_error(
+                        "successful N-Gram tree round produced no output token");
+            }
+
+            const llama_token token =
+                    ready_tokens_.front();
+
+            ready_tokens_.pop_front();
+            return token;
+        }
+
         return decode_next_sequential();
     }
 
@@ -1118,6 +1456,504 @@ try_ngram_speculative_round(
     }
 }
 
+
+
+
+bool
+server_generation_decode_executor::
+try_ngram_tree_speculative_round(
+        int32_t remaining_output_tokens) {
+    if (!ngram_spec_enabled_ ||
+            !conflayer_ ||
+            !ngram_ready_ ||
+            !ctx_ ||
+            !sampler_ ||
+            sequence_id_ != 0 ||
+            pending_token_ == LLAMA_TOKEN_NULL) {
+        return false;
+    }
+
+    const uint32_t until_opt =
+            conflayer_->external_tokens_until_optimization();
+
+    // The root itself consumes one committed Decode position. If the next
+    // optimization boundary is immediately after the root, the sequential
+    // path is cheaper and preserves exactly the same lifecycle.
+    if (until_opt == 0 || until_opt == 1) {
+        return false;
+    }
+
+    auto lookup =
+            ngram_trie_.lookup(
+                    ngram_history_,
+                    pending_token_);
+
+    const size_t min_prefix_length =
+            ngram_tree_min_prefix_length();
+
+    if (!lookup.suffixes.empty() &&
+            lookup.matched_prefix_length <
+                    min_prefix_length) {
+        fprintf(
+                stderr,
+                "NGRAM_SPEC_PREFIX_REJECT: "
+                "position=%d history=%zu "
+                "matched_prefix=%u min_prefix=%zu\n",
+                (int) next_position_,
+                ngram_history_.size(),
+                lookup.matched_prefix_length,
+                min_prefix_length);
+
+        return false;
+    }
+
+    // Mobile verifier: frequency-prune candidate width.
+    // Trie lookup is already frequency-first.
+    const size_t tree_max_branches =
+            ngram_tree_max_branches();
+
+    if (lookup.suffixes.size() >
+            tree_max_branches) {
+        lookup.suffixes.resize(
+                tree_max_branches);
+    }
+
+    if (lookup.suffixes.empty()) {
+        fprintf(stderr,
+                "NGRAM_SPEC_MISS: position=%d history=%zu\n",
+                (int) next_position_,
+                ngram_history_.size());
+        return false;
+    }
+
+    const size_t suffix_depth =
+            static_cast<size_t>(
+                    ngram_trie_.ngram_size() -
+                    ngram_trie_.prefix_length());
+
+    const size_t tree_max_draft =
+            ngram_tree_max_draft();
+
+    size_t max_depth =
+            std::min(
+                    suffix_depth,
+                    tree_max_draft);
+
+    if (remaining_output_tokens >= 0) {
+        if (remaining_output_tokens <= 1) {
+            return false;
+        }
+
+        max_depth =
+                std::min(
+                        max_depth,
+                        static_cast<size_t>(
+                                remaining_output_tokens - 1));
+    }
+
+    if (until_opt != UINT32_MAX) {
+        max_depth =
+                std::min(
+                        max_depth,
+                        static_cast<size_t>(
+                                until_opt - 1));
+    }
+
+    // The speculative root is evaluated at next_position_. A node at tree
+    // depth d is evaluated at next_position_ + d, so the deepest node must
+    // remain strictly below llama_n_ctx_seq().
+    //
+    // Example:
+    //   n_ctx_seq     = 2048
+    //   next_position = 2046
+    //
+    // Valid positions are 2046 (root) and 2047, therefore max_depth <= 1.
+    const uint64_t ctx_capacity =
+            static_cast<uint64_t>(
+                    llama_n_ctx_seq(
+                            ctx_.get()));
+
+    const uint64_t root_position =
+            static_cast<uint64_t>(
+                    next_position_);
+
+    if (root_position >= ctx_capacity) {
+        fprintf(stderr,
+                "NGRAM_SPEC_CONTEXT_FALLBACK: "
+                "position=%d capacity=%llu\n",
+                (int) next_position_,
+                (unsigned long long) ctx_capacity);
+        return false;
+    }
+
+    const size_t ctx_max_depth =
+            static_cast<size_t>(
+                    ctx_capacity -
+                    root_position -
+                    1);
+
+    max_depth =
+            std::min(
+                    max_depth,
+                    ctx_max_depth);
+
+    if (max_depth == 0) {
+        return false;
+    }
+
+    const llama_vocab * vocab =
+            llama_model_get_vocab(model_);
+
+    if (vocab == nullptr) {
+        throw std::runtime_error(
+                "N-Gram verification has no vocabulary");
+    }
+
+    const llama_token eos_token =
+            llama_vocab_eos(vocab);
+
+    // Worst-case candidate tree:
+    //
+    //   root + branches * draft-depth
+    //
+    // Shared prefixes can make the actual tree smaller.
+    const size_t TREE_NODE_BUDGET =
+            1 +
+            tree_max_branches *
+            max_depth;
+
+    // seq0 plus one temporary sequence per branch.
+    const size_t TREE_SEQ_BUDGET =
+            tree_max_branches + 1;
+
+    const auto tree =
+            server_ngram_build_candidate_tree(
+                    pending_token_,
+                    lookup,
+                    TREE_NODE_BUDGET,
+                    max_depth,
+                    eos_token);
+
+    if (!tree.hit()) {
+        return false;
+    }
+
+    server_ngram_verification_plan plan;
+
+    if (!server_ngram_build_verification_plan(
+                tree,
+                TREE_SEQ_BUDGET,
+                plan)) {
+        fprintf(stderr,
+                "NGRAM_SPEC_PLAN_FALLBACK: "
+                "nodes=%zu matched_prefix=%u\n",
+                tree.nodes.size(),
+                lookup.matched_prefix_length);
+        return false;
+    }
+
+    if (plan.branch_count() == 0 ||
+            plan.branch_count() + 1 >
+                    llama_n_seq_max(ctx_.get())) {
+        return false;
+    }
+
+    llama_memory_t mem =
+            llama_get_memory(ctx_.get());
+
+    if (mem == nullptr) {
+        return false;
+    }
+
+    // Defensive cleanup. A completed round leaves only seq 0, but this also
+    // recovers cleanly if an earlier request aborted after creating branches.
+    llama_memory_seq_keep(
+            mem,
+            sequence_id_);
+
+    // Share committed history with every temporary leaf sequence. Because the
+    // Decode Context uses unified KV this is metadata-only.
+    for (size_t i = 0;
+            i < plan.branch_count();
+            ++i) {
+        const llama_seq_id branch =
+                static_cast<llama_seq_id>(i + 1);
+
+        llama_memory_seq_cp(
+                mem,
+                sequence_id_,
+                branch,
+                0,
+                next_position_);
+    }
+
+    // Match llama_conflayer::verify_tree(): shallow nodes first.
+    // Parent-before-child alone is not strong enough for the in-batch
+    // tree causal-mask assumptions used by the existing verifier.
+    std::vector<int32_t> verification_order(
+            tree.nodes.size());
+
+    for (size_t i = 0;
+            i < tree.nodes.size();
+            ++i) {
+        verification_order[i] =
+                static_cast<int32_t>(i);
+    }
+
+    std::stable_sort(
+            verification_order.begin(),
+            verification_order.end(),
+            [&](int32_t a, int32_t b) {
+                if (tree.nodes[a].depth !=
+                        tree.nodes[b].depth) {
+                    return tree.nodes[a].depth <
+                            tree.nodes[b].depth;
+                }
+
+                return a < b;
+            });
+
+    std::vector<int32_t> node_to_batch_row(
+            tree.nodes.size(),
+            -1);
+
+    generation_batch_guard batch(
+            static_cast<int32_t>(
+                    tree.nodes.size()),
+            static_cast<int32_t>(
+                    plan.branch_count() + 1));
+
+    for (size_t row = 0;
+            row < verification_order.size();
+            ++row) {
+        const int32_t node_id =
+                verification_order[row];
+
+        const auto & node =
+                tree.nodes[node_id];
+
+        node_to_batch_row[node_id] =
+                static_cast<int32_t>(row);
+
+        common_batch_add(
+                batch.batch,
+                node.token,
+                next_position_ +
+                        static_cast<llama_pos>(
+                                node.depth),
+                plan.node_seq_ids[node_id],
+                true);
+    }
+
+    int ret = 0;
+
+    try {
+        ret =
+                llama_decode(
+                        ctx_.get(),
+                        batch.batch);
+
+        if (ret != 0) {
+            throw std::runtime_error(
+                    "N-Gram tree verifier Decode failed");
+        }
+
+        llama_synchronize(ctx_.get());
+
+        // Work on a cloned sampler so a verifier failure cannot partially
+        // advance the externally visible request sampler.
+        common_sampler_ptr sampler_work;
+        sampler_work.reset(
+                common_sampler_clone(
+                        sampler_.get()));
+
+        if (!sampler_work) {
+            throw std::runtime_error(
+                    "failed to clone sampler for N-Gram verification");
+        }
+
+        std::vector<llama_token> committed;
+        std::vector<llama_token> produced;
+
+        committed.reserve(max_depth + 1);
+        produced.reserve(max_depth + 1);
+
+        // The root has already been sampled and accepted by the live sampler
+        // before entering this round. The tree Decode evaluates it now.
+        committed.push_back(
+                pending_token_);
+
+        int32_t current_node = 0;
+        llama_token next_pending =
+                LLAMA_TOKEN_NULL;
+
+        while (true) {
+            if (current_node < 0 ||
+                    static_cast<size_t>(current_node) >=
+                            tree.nodes.size()) {
+                throw std::runtime_error(
+                        "N-Gram verifier reached invalid tree node");
+            }
+
+            // Every tree node requested logits, so output row i corresponds
+            // directly to candidate-tree node i.
+            const llama_token sampled =
+                    common_sampler_sample(
+                            sampler_work.get(),
+                            ctx_.get(),
+                            node_to_batch_row[current_node]);
+
+            common_sampler_accept(
+                    sampler_work.get(),
+                    sampled,
+                    true);
+
+            produced.push_back(sampled);
+
+            // Match normal server semantics: an EOG token is returned to the
+            // caller but is not speculatively committed as another KV token.
+            if (llama_vocab_is_eog(
+                        vocab,
+                        sampled)) {
+                next_pending = sampled;
+                break;
+            }
+
+            int32_t matched_child = -1;
+
+            for (const int32_t child :
+                    tree.nodes[current_node].children) {
+                if (child < 0 ||
+                        static_cast<size_t>(child) >=
+                                tree.nodes.size()) {
+                    throw std::runtime_error(
+                            "N-Gram verifier tree contains invalid child");
+                }
+
+                if (tree.nodes[child].token ==
+                        sampled) {
+                    matched_child = child;
+                    break;
+                }
+            }
+
+            if (matched_child < 0) {
+                // Verifier disagreed with every N-Gram branch. The sampled
+                // token becomes the next normal pending token.
+                next_pending = sampled;
+                break;
+            }
+
+            committed.push_back(sampled);
+            current_node = matched_child;
+        }
+
+        if (next_pending == LLAMA_TOKEN_NULL ||
+                committed.empty() ||
+                produced.empty()) {
+            throw std::runtime_error(
+                    "N-Gram verifier produced an invalid result");
+        }
+
+        // Any descendant leaf sequence below current_node contains the KV
+        // cells for the complete accepted prefix because every shared ancestor
+        // carries all descendant leaf sequence IDs.
+        const auto & accepted_node_seqs =
+                plan.node_seq_ids[current_node];
+
+        if (accepted_node_seqs.empty()) {
+            throw std::runtime_error(
+                    "accepted N-Gram node has no branch sequence");
+        }
+
+        const llama_seq_id accepted_seq =
+                accepted_node_seqs.front();
+
+        const llama_pos commit_end =
+                next_position_ +
+                static_cast<llama_pos>(
+                        committed.size());
+
+        // Add seq 0 to the accepted branch cells. Under unified KV this is
+        // metadata-only and supports this exact partial range.
+        llama_memory_seq_cp(
+                mem,
+                accepted_seq,
+                sequence_id_,
+                next_position_,
+                commit_end);
+
+        // Delete rejected branch-only cells and remove temporary sequence IDs
+        // from shared history / accepted cells.
+        llama_memory_seq_keep(
+                mem,
+                sequence_id_);
+
+        // All verifier logits have been consumed at this point. Only now may
+        // ConFLayer trigger dynamic_optimization(), which performs another
+        // Decode and invalidates those logits.
+        if (!conflayer_->advance_external_tokens(
+                    committed)) {
+            throw std::runtime_error(
+                    "ConfLayers rejected speculative external advance");
+        }
+
+        ngram_history_.insert(
+                ngram_history_.end(),
+                committed.begin(),
+                committed.end());
+
+        next_position_ = commit_end;
+        pending_token_ = next_pending;
+
+        // Commit sampler state only after KV commit and ConFLayer bookkeeping
+        // have both succeeded.
+        sampler_ = std::move(sampler_work);
+
+        ready_tokens_.clear();
+
+        // produced contains:
+        //
+        //   accepted draft tokens, if any
+        //   +
+        //   exactly one next pending token
+        //
+        // The old server API still returns only one token per decode_next().
+        for (const llama_token token :
+                produced) {
+            ready_tokens_.push_back(token);
+        }
+
+        fprintf(stderr,
+                "NGRAM_SPEC_ROUND: mode=tree position=%d "
+                "matched_prefix=%u suffixes=%zu "
+                "tree_nodes=%zu branches=%zu "
+                "accepted_draft=%zu committed=%zu "
+                "queued=%zu until_opt=%u remaining=%d\n",
+                (int) (next_position_ -
+                        static_cast<llama_pos>(
+                                committed.size())),
+                lookup.matched_prefix_length,
+                lookup.suffixes.size(),
+                tree.nodes.size(),
+                plan.branch_count(),
+                committed.size() - 1,
+                committed.size(),
+                produced.size(),
+                until_opt,
+                remaining_output_tokens);
+
+        return true;
+    } catch (...) {
+        // Tree tokens were written only to temporary branch sequences until
+        // the explicit commit above. Keeping seq 0 removes all rejected /
+        // partially written speculative KV on failure.
+        llama_memory_seq_keep(
+                mem,
+                sequence_id_);
+        throw;
+    }
+}
 
 
 void server_generation_decode_executor::reset() {

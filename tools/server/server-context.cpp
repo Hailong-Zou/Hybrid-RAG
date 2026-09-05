@@ -922,6 +922,14 @@ private:
 
     std::uint64_t next_generation_handoff_handle = 1;
 
+    // Diagnostic-only guard: compare A/C/D Decode Contexts once against
+    // exactly the same retained Generation handoff.
+    bool nseq_diag_shadow_acd_done = false;
+
+    // Diagnostic-only: compare sequential and multi-branch N-Gram Tree
+    // using exactly the same Generation handoff.
+    bool ngram_diag_shadow_tree_done = false;
+
     llama_context * ctx_tgt = nullptr;
 
     server_batch batch;
@@ -2153,6 +2161,326 @@ private:
                                 stored_generation_handoff
                                         ->prompt_tokens.size());
 
+                const char * nseq_shadow_acd =
+                        std::getenv(
+                                "LLAMA_NSEQ_DIAG_SHADOW_ACD");
+
+                if (!nseq_diag_shadow_acd_done &&
+                        nseq_shadow_acd != nullptr &&
+                        std::strcmp(
+                                nseq_shadow_acd,
+                                "1") == 0) {
+                    nseq_diag_shadow_acd_done = true;
+
+                    if (!params_base.conflayer) {
+                        throw std::runtime_error(
+                                "LLAMA_NSEQ_DIAG_SHADOW_ACD requires "
+                                "ConFLayer to be enabled");
+                    }
+
+                    if (std::getenv("LLAMA_NSEQ_DIAG_MAX") != nullptr ||
+                            std::getenv(
+                                    "LLAMA_NSEQ_DIAG_UNIFIED") != nullptr) {
+                        throw std::runtime_error(
+                                "LLAMA_NSEQ_DIAG_SHADOW_ACD cannot be "
+                                "combined with LLAMA_NSEQ_DIAG_MAX or "
+                                "LLAMA_NSEQ_DIAG_UNIFIED");
+                    }
+
+                    struct nseq_shadow_variant {
+                        const char * label;
+                        uint32_t n_seq_max;
+                        bool kv_unified;
+                    };
+
+                    const nseq_shadow_variant variants[] = {
+                        {"A",  1, false},
+                        {"C",  1, true },
+                        {"D", 32, true },
+                    };
+
+                    const llama_vocab * decode_vocab =
+                            llama_model_get_vocab(decode_model);
+
+                    if (decode_vocab == nullptr) {
+                        throw std::runtime_error(
+                                "NSEQ shadow diagnostic has no vocabulary");
+                    }
+
+                    for (const auto & variant : variants) {
+                        auto shadow_context_params =
+                                decode_context_params;
+
+                        shadow_context_params.n_seq_max =
+                                variant.n_seq_max;
+                        shadow_context_params.kv_unified =
+                                variant.kv_unified;
+
+                        fprintf(
+                                stderr,
+                                "NSEQ_SHADOW_BEGIN: "
+                                "label=%s n_seq_max=%u kv_unified=%d "
+                                "state_checksum=%" PRIu64 " "
+                                "logits_checksum=%" PRIu64 "\n",
+                                variant.label,
+                                variant.n_seq_max,
+                                (int) variant.kv_unified,
+                                stored_generation_handoff
+                                        ->sequence_state_checksum,
+                                stored_generation_handoff
+                                        ->final_logits_checksum);
+
+                        server_generation_decode_executor
+                                shadow_executor(
+                                        decode_model,
+                                        shadow_context_params,
+                                        0,
+                                        params_base.conflayer,
+                                        params_base
+                                                .conflayer_max_skip_layers,
+                                        false);
+
+                        std::vector<llama_token> shadow_tokens;
+                        shadow_tokens.reserve(32);
+
+                        llama_token token =
+                                shadow_executor.begin(
+                                        *stored_generation_handoff);
+
+                        shadow_tokens.push_back(token);
+
+                        for (int step = 1;
+                                step < 32 &&
+                                !llama_vocab_is_eog(
+                                        decode_vocab,
+                                        token);
+                                ++step) {
+                            token =
+                                    shadow_executor.decode_next(
+                                            32 - step);
+
+                            shadow_tokens.push_back(token);
+                        }
+
+                        std::string token_csv;
+
+                        for (std::size_t i = 0;
+                                i < shadow_tokens.size();
+                                ++i) {
+                            if (i != 0) {
+                                token_csv += ",";
+                            }
+
+                            token_csv +=
+                                    std::to_string(
+                                            shadow_tokens[i]);
+                        }
+
+                        fprintf(
+                                stderr,
+                                "NSEQ_SHADOW_RESULT: "
+                                "label=%s tokens=%zu ids=%s\n",
+                                variant.label,
+                                shadow_tokens.size(),
+                                token_csv.c_str());
+
+                        shadow_executor.reset();
+
+                        fprintf(
+                                stderr,
+                                "NSEQ_SHADOW_END: label=%s\n",
+                                variant.label);
+                    }
+                }
+
+                const char * ngram_shadow_tree =
+                        std::getenv(
+                                "LLAMA_NGRAM_DIAG_SHADOW_TREE");
+
+                if (!ngram_diag_shadow_tree_done &&
+                        ngram_shadow_tree != nullptr &&
+                        std::strcmp(
+                                ngram_shadow_tree,
+                                "1") == 0) {
+                    ngram_diag_shadow_tree_done = true;
+
+                    if (!params_base.conflayer) {
+                        throw std::runtime_error(
+                                "N-Gram Tree shadow requires ConFLayer");
+                    }
+
+                    const char * tree_mode =
+                            std::getenv(
+                                    "LLAMA_NGRAM_DIAG_TREE");
+
+                    if (tree_mode == nullptr ||
+                            std::strcmp(tree_mode, "1") != 0) {
+                        throw std::runtime_error(
+                                "N-Gram Tree shadow requires "
+                                "LLAMA_NGRAM_DIAG_TREE=1");
+                    }
+
+                    auto shadow_context_params =
+                            decode_context_params;
+
+                    shadow_context_params.n_seq_max = 32;
+                    shadow_context_params.kv_unified = true;
+
+                    if (shadow_context_params.n_outputs_max < 32) {
+                        shadow_context_params.n_outputs_max = 32;
+                    }
+
+                    const llama_vocab * shadow_vocab =
+                            llama_model_get_vocab(
+                                    decode_model);
+
+                    if (shadow_vocab == nullptr) {
+                        throw std::runtime_error(
+                                "N-Gram Tree shadow has no vocabulary");
+                    }
+
+                    auto run_shadow =
+                            [&](const char * label,
+                                bool enable_ngram) {
+                        server_generation_decode_executor executor(
+                                decode_model,
+                                shadow_context_params,
+                                0,
+                                params_base.conflayer,
+                                params_base.conflayer_max_skip_layers,
+                                enable_ngram);
+
+                        std::vector<llama_token> tokens;
+                        tokens.reserve(8);
+
+                        llama_token token =
+                                executor.begin(
+                                        *stored_generation_handoff);
+
+                        tokens.push_back(token);
+
+                        for (int step = 1;
+                                step < 8 &&
+                                !llama_vocab_is_eog(
+                                        shadow_vocab,
+                                        token);
+                                ++step) {
+                            token =
+                                    executor.decode_next(
+                                            8 - step);
+
+                            tokens.push_back(token);
+                        }
+
+                        std::string csv;
+
+                        for (std::size_t i = 0;
+                                i < tokens.size();
+                                ++i) {
+                            if (i != 0) {
+                                csv += ",";
+                            }
+
+                            csv +=
+                                    std::to_string(
+                                            tokens[i]);
+                        }
+
+                        fprintf(
+                                stderr,
+                                "NGRAM_TREE_SHADOW_RESULT: "
+                                "label=%s tokens=%zu ids=%s "
+                                "state_checksum=%" PRIu64 " "
+                                "logits_checksum=%" PRIu64 "\n",
+                                label,
+                                tokens.size(),
+                                csv.c_str(),
+                                stored_generation_handoff
+                                        ->sequence_state_checksum,
+                                stored_generation_handoff
+                                        ->final_logits_checksum);
+
+                        executor.reset();
+
+                        return tokens;
+                    };
+
+                    const auto seq_tokens =
+                            run_shadow(
+                                    "SEQ",
+                                    false);
+
+                    const auto tree_tokens =
+                            run_shadow(
+                                    "TREE",
+                                    true);
+
+                    const bool match =
+                            seq_tokens == tree_tokens;
+
+                    std::size_t first_diff = 0;
+
+                    while (first_diff <
+                                    seq_tokens.size() &&
+                            first_diff <
+                                    tree_tokens.size() &&
+                            seq_tokens[first_diff] ==
+                                    tree_tokens[first_diff]) {
+                        ++first_diff;
+                    }
+
+                    const llama_token seq_diff =
+                            first_diff < seq_tokens.size()
+                                    ? seq_tokens[first_diff]
+                                    : LLAMA_TOKEN_NULL;
+
+                    const llama_token tree_diff =
+                            first_diff < tree_tokens.size()
+                                    ? tree_tokens[first_diff]
+                                    : LLAMA_TOKEN_NULL;
+
+                    fprintf(
+                            stderr,
+                            "NGRAM_TREE_SHADOW_COMPARE: "
+                            "match=%d "
+                            "seq_tokens=%zu "
+                            "tree_tokens=%zu "
+                            "first_diff=%zu "
+                            "seq_token=%d "
+                            "tree_token=%d\n",
+                            match ? 1 : 0,
+                            seq_tokens.size(),
+                            tree_tokens.size(),
+                            first_diff,
+                            (int) seq_diff,
+                            (int) tree_diff);
+                }
+
+                const char * handoff_replay_keep_env =
+                        std::getenv(
+                                "LLAMA_HANDOFF_REPLAY_KEEP");
+
+                const bool handoff_replay_keep =
+                        handoff_replay_keep_env != nullptr &&
+                        std::strcmp(
+                                handoff_replay_keep_env,
+                                "1") == 0;
+
+                // Diagnostic fixed-handoff replay:
+                // recreate the Decode executor for every consumption so
+                // runtime B/D configuration and n_seq_max are refreshed.
+                if (handoff_replay_keep &&
+                        slot.generation_decode_executor) {
+                    slot.generation_decode_executor->reset();
+                    slot.generation_decode_executor.reset();
+
+                    fprintf(
+                            stderr,
+                            "HANDOFF_REPLAY_EXECUTOR_RESET: "
+                            "handle=%" PRIu64 "\n",
+                            generation_handoff_handle);
+                }
+
                 if (!slot.generation_decode_executor) {
                     slot.generation_decode_executor =
                             std::make_unique<
@@ -2188,7 +2516,32 @@ private:
 
             // One-shot ownership: retain the handoff on every failure before
             // begin(), but permanently consume it once begin() succeeds.
-            generation_handoffs.erase(generation_handoff_handle);
+            const char * handoff_replay_keep_erase_env =
+                    std::getenv(
+                            "LLAMA_HANDOFF_REPLAY_KEEP");
+
+            const bool handoff_replay_keep_erase =
+                    handoff_replay_keep_erase_env != nullptr &&
+                    std::strcmp(
+                            handoff_replay_keep_erase_env,
+                            "1") == 0;
+
+            if (!handoff_replay_keep_erase) {
+                generation_handoffs.erase(
+                        generation_handoff_handle);
+            } else {
+                fprintf(
+                        stderr,
+                        "HANDOFF_REPLAY_RETAINED: "
+                        "handle=%" PRIu64 " "
+                        "state_checksum=%" PRIu64 " "
+                        "logits_checksum=%" PRIu64 "\n",
+                        generation_handoff_handle,
+                        stored_generation_handoff
+                                ->sequence_state_checksum,
+                        stored_generation_handoff
+                                ->final_logits_checksum);
+            }
 
             slot.state = SLOT_STATE_GENERATING;
 
@@ -4457,6 +4810,16 @@ private:
                                         slot.prompt.tokens.pos_next(),
                                         slot.task->params.sampling));
 
+                const auto & handoff_prompt_tokens =
+                        slot.generation_handoff->prompt_tokens;
+
+                const std::uint64_t handoff_prompt_checksum =
+                        server_generation_state_checksum(
+                                reinterpret_cast<const std::uint8_t *>(
+                                        handoff_prompt_tokens.data()),
+                                handoff_prompt_tokens.size() *
+                                        sizeof(llama_token));
+
                 SLT_INF(
                         slot,
                         "generation handoff exported before sampling: "
@@ -4476,6 +4839,31 @@ private:
                                 ->sequence_state.size(),
                         slot.generation_handoff
                                 ->final_logits.size(),
+                        slot.generation_handoff
+                                ->producer_backend.c_str());
+
+                SLT_INF(
+                        slot,
+                        "NSEQ_HANDOFF_FINGERPRINT: "
+                        "prompt_tokens=%zu "
+                        "prompt_checksum=%" PRIu64 " "
+                        "next_position=%d "
+                        "state_bytes=%zu "
+                        "state_checksum=%" PRIu64 " "
+                        "logits_count=%zu "
+                        "logits_checksum=%" PRIu64 " "
+                        "producer_backend=%s\n",
+                        handoff_prompt_tokens.size(),
+                        handoff_prompt_checksum,
+                        (int) slot.generation_handoff->next_position,
+                        slot.generation_handoff
+                                ->sequence_state.size(),
+                        slot.generation_handoff
+                                ->sequence_state_checksum,
+                        slot.generation_handoff
+                                ->final_logits.size(),
+                        slot.generation_handoff
+                                ->final_logits_checksum,
                         slot.generation_handoff
                                 ->producer_backend.c_str());
 

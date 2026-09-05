@@ -106,4 +106,7 @@ private:
     // contains at least the next externally visible token.
     bool try_ngram_speculative_round(
             int32_t remaining_output_tokens);
+
+    bool try_ngram_tree_speculative_round(
+            int32_t remaining_output_tokens);
 };
