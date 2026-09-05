@@ -165,6 +165,30 @@ size_t ngram_tree_max_draft() {
             8);
 }
 
+// Context capacity is fixed when the Decode Context is created.
+//
+// This is intentionally independent from runtime B/D. The server reserves
+// enough temporary sequences/output rows once, while each request can select
+// a smaller B/D dynamically through LLAMA_NGRAM_TREE_MAX_{BRANCHES,DRAFT}_FILE.
+//
+// Defaults match the maximum currently accepted runtime B/D, so any valid
+// runtime configuration can be selected without recreating the Context.
+size_t ngram_tree_branch_capacity() {
+    return ngram_tree_env_size(
+            "LLAMA_NGRAM_TREE_BRANCH_CAPACITY",
+            8,
+            1,
+            8);
+}
+
+size_t ngram_tree_draft_capacity() {
+    return ngram_tree_env_size(
+            "LLAMA_NGRAM_TREE_DRAFT_CAPACITY",
+            8,
+            1,
+            8);
+}
+
 
 size_t ngram_runtime_size() {
     return ngram_tree_runtime_size(
@@ -456,30 +480,35 @@ server_generation_decode_executor(
     // Decode graph merely because speculative decoding is enabled.
     if (ngram_spec_enabled_) {
         if (ngram_diag_tree_enabled()) {
-            const size_t tree_max_branches =
-                    ngram_tree_max_branches();
+            const size_t retained_path_capacity =
+                    ngram_tree_branch_capacity();
 
-            const size_t tree_max_draft =
-                    ngram_tree_max_draft();
+            const size_t tree_draft_capacity =
+                    ngram_tree_draft_capacity();
 
             // seq0 = committed history.
             // seq1..N = temporary candidate leaves.
+            //
+            // Allocate from startup capacity, not the current runtime B.
+            // Runtime B may change between requests without recreating ctx_.
             context_params.n_seq_max =
                     static_cast<uint32_t>(
-                            tree_max_branches + 1);
+                            retained_path_capacity + 1);
 
             context_params.kv_unified = true;
 
             // Keep at least 32 output rows for ConfLayer optimization.
-            // Tree verification itself needs at most:
             //
-            //   root + branches * draft
+            // The maximum verification tree representable by this Context is:
             //
+            //   root + branch_capacity * draft_capacity
+            //
+            // Runtime B/D are bounded by these capacities.
             const uint32_t tree_outputs =
                     static_cast<uint32_t>(
                             1 +
-                            tree_max_branches *
-                            tree_max_draft);
+                            retained_path_capacity *
+                            tree_draft_capacity);
 
             const uint32_t required_outputs =
                     std::max<uint32_t>(
@@ -494,11 +523,11 @@ server_generation_decode_executor(
 
             fprintf(
                     stderr,
-                    "NGRAM_TREE_CONFIG: "
-                    "branches=%zu draft=%zu "
+                    "NGRAM_TREE_CAPACITY: "
+                    "branch_capacity=%zu draft_capacity=%zu "
                     "n_seq_max=%u max_nodes=%u\n",
-                    tree_max_branches,
-                    tree_max_draft,
+                    retained_path_capacity,
+                    tree_draft_capacity,
                     context_params.n_seq_max,
                     tree_outputs);
         } else {
@@ -592,7 +621,7 @@ server_generation_decode_executor(
     if (ngram_spec_enabled_) {
         if (ngram_diag_tree_enabled()) {
             const size_t required_sequences =
-                    ngram_tree_max_branches() + 1;
+                    ngram_tree_branch_capacity() + 1;
 
             if (llama_n_seq_max(ctx_.get()) <
                         required_sequences ||
@@ -765,6 +794,12 @@ llama_token server_generation_decode_executor::begin(
             const size_t runtime_min_prefix_length =
                     ngram_tree_min_prefix_length();
 
+            const size_t runtime_max_branches =
+                    ngram_tree_max_branches();
+
+            const size_t runtime_max_draft =
+                    ngram_tree_max_draft();
+
             if (runtime_prefix_length >= runtime_ngram_size) {
                 throw std::runtime_error(
                         "N-Gram prefix length must be smaller than ngram size");
@@ -776,6 +811,23 @@ llama_token server_generation_decode_executor::begin(
                         "N-Gram tree minimum prefix length must not exceed "
                         "configured prefix length");
             }
+
+            if (runtime_max_branches >
+                        ngram_tree_branch_capacity() ||
+                    runtime_max_draft >
+                        ngram_tree_draft_capacity()) {
+                throw std::runtime_error(
+                        "N-Gram tree runtime B/D exceeds Decode Context capacity");
+            }
+
+            ngram_min_prefix_length_ =
+                    runtime_min_prefix_length;
+
+            ngram_max_branches_ =
+                    runtime_max_branches;
+
+            ngram_max_draft_ =
+                    runtime_max_draft;
 
             ngram_trie_ =
                     server_ngram_trie(
@@ -790,6 +842,19 @@ llama_token server_generation_decode_executor::begin(
                     runtime_ngram_size,
                     runtime_prefix_length,
                     runtime_min_prefix_length);
+
+            fprintf(
+                    stderr,
+                    "NGRAM_RUNTIME_CONFIG: "
+                    "n=%zu prefix=%zu min_prefix=%zu "
+                    "branches=%zu draft=%zu framework=%s "
+                    "lookup_window=4\n",
+                    runtime_ngram_size,
+                    runtime_prefix_length,
+                    ngram_min_prefix_length_,
+                    ngram_max_branches_,
+                    ngram_max_draft_,
+                    ngram_native_framework_ ? "native" : "custom");
 
             ngram_ready_ =
                     ngram_trie_.build(
@@ -816,6 +881,15 @@ llama_token server_generation_decode_executor::begin(
                         const common_speculative_draft_params & params,
                         llama_tokens & result) {
                     draft_ngram_linear_native(
+                            seq_id,
+                            params,
+                            result);
+                };
+                external.draft_tree = [this](
+                        llama_seq_id seq_id,
+                        const common_speculative_tree_draft_params & params,
+                        common_speculative_tree_draft & result) {
+                    draft_ngram_tree_native(
                             seq_id,
                             params,
                             result);
@@ -1081,6 +1155,113 @@ draft_ngram_linear_native(
         }
 
         result.push_back(token);
+    }
+}
+
+void
+server_generation_decode_executor::
+draft_ngram_tree_native(
+        llama_seq_id seq_id,
+        const common_speculative_tree_draft_params & params,
+        common_speculative_tree_draft & result) {
+    result.clear();
+
+    if (!ngram_ready_ ||
+            seq_id != sequence_id_ ||
+            params.prompt == nullptr ||
+            params.id_last == LLAMA_TOKEN_NULL ||
+            params.n_paths <= 0 ||
+            params.n_max <= 0) {
+        return;
+    }
+
+    auto lookup =
+            ngram_trie_.lookup(
+                    *params.prompt,
+                    params.id_last);
+
+    result.matched_prefix_length =
+            lookup.matched_prefix_length;
+
+    const size_t min_prefix_length =
+            ngram_min_prefix_length_;
+
+    if (!lookup.suffixes.empty() &&
+            lookup.matched_prefix_length <
+                    min_prefix_length) {
+        fprintf(
+                stderr,
+                "NGRAM_SPEC_PREFIX_REJECT: "
+                "position=%d history=%zu "
+                "matched_prefix=%u min_prefix=%zu\n",
+                (int) params.n_past,
+                params.prompt->size(),
+                lookup.matched_prefix_length,
+                min_prefix_length);
+
+        return;
+    }
+
+    const size_t retained_path_limit =
+            static_cast<size_t>(
+                    params.n_paths);
+
+    if (lookup.suffixes.size() >
+            retained_path_limit) {
+        lookup.suffixes.resize(
+                retained_path_limit);
+    }
+
+    if (lookup.suffixes.empty()) {
+        return;
+    }
+
+    result.retained_path_count =
+            lookup.suffixes.size();
+
+    const size_t max_depth =
+            static_cast<size_t>(
+                    params.n_max);
+
+    const size_t node_budget =
+            1 +
+            result.retained_path_count *
+                    max_depth;
+
+    const llama_vocab * vocab =
+            llama_model_get_vocab(model_);
+
+    if (vocab == nullptr) {
+        throw std::runtime_error(
+                "cannot build native N-Gram tree without vocabulary");
+    }
+
+    const auto server_tree =
+            server_ngram_build_candidate_tree(
+                    params.id_last,
+                    lookup,
+                    node_budget,
+                    max_depth,
+                    llama_vocab_eos(vocab));
+
+    if (!server_tree.hit()) {
+        result.clear();
+        return;
+    }
+
+    result.nodes.reserve(
+            server_tree.nodes.size());
+
+    for (const auto & node :
+            server_tree.nodes) {
+        common_speculative_tree_node native_node;
+        native_node.token = node.token;
+        native_node.parent = node.parent;
+        native_node.score = node.weight;
+        native_node.children = node.children;
+
+        result.nodes.push_back(
+                std::move(native_node));
     }
 }
 
@@ -1686,56 +1867,21 @@ try_ngram_tree_speculative_round(
         return false;
     }
 
-    auto lookup =
-            ngram_trie_.lookup(
-                    ngram_history_,
-                    pending_token_);
+    // B limits the number of frequency-ranked suffix paths retained before
+    // shared-prefix merging. It is not a per-node child limit.
+    //
+    // Runtime B/D are deliberately read independently from Context capacity,
+    // allowing parameter sweeps between requests without restarting server.
+    const size_t retained_path_limit =
+            ngram_max_branches_;
 
-    const size_t min_prefix_length =
-            ngram_tree_min_prefix_length();
-
-    if (!lookup.suffixes.empty() &&
-            lookup.matched_prefix_length <
-                    min_prefix_length) {
-        fprintf(
-                stderr,
-                "NGRAM_SPEC_PREFIX_REJECT: "
-                "position=%d history=%zu "
-                "matched_prefix=%u min_prefix=%zu\n",
-                (int) next_position_,
-                ngram_history_.size(),
-                lookup.matched_prefix_length,
-                min_prefix_length);
-
-        return false;
-    }
-
-    // Mobile verifier: frequency-prune candidate width.
-    // Trie lookup is already frequency-first.
-    const size_t tree_max_branches =
-            ngram_tree_max_branches();
-
-    if (lookup.suffixes.size() >
-            tree_max_branches) {
-        lookup.suffixes.resize(
-                tree_max_branches);
-    }
-
-    if (lookup.suffixes.empty()) {
-        fprintf(stderr,
-                "NGRAM_SPEC_MISS: position=%d history=%zu\n",
-                (int) next_position_,
-                ngram_history_.size());
-        return false;
-    }
+    const size_t tree_max_draft =
+            ngram_max_draft_;
 
     const size_t suffix_depth =
             static_cast<size_t>(
                     ngram_trie_.ngram_size() -
                     ngram_trie_.prefix_length());
-
-    const size_t tree_max_draft =
-            ngram_tree_max_draft();
 
     size_t max_depth =
             std::min(
@@ -1812,34 +1958,127 @@ try_ngram_tree_speculative_round(
                 "N-Gram verification has no vocabulary");
     }
 
-    const llama_token eos_token =
-            llama_vocab_eos(vocab);
+    server_ngram_candidate_tree tree;
 
-    // Worst-case candidate tree:
-    //
-    //   root + branches * draft-depth
-    //
-    // Shared prefixes can make the actual tree smaller.
-    const size_t TREE_NODE_BUDGET =
-            1 +
-            tree_max_branches *
-            max_depth;
+    if (ngram_native_framework_) {
+        if (!ngram_native_spec_) {
+            return false;
+        }
 
-    // seq0 plus one temporary sequence per branch.
-    const size_t TREE_SEQ_BUDGET =
-            tree_max_branches + 1;
+        const bool drafted =
+                common_speculative_draft_tree(
+                        ngram_native_spec_.get(),
+                        sequence_id_,
+                        {
+                            /* .n_paths = */ static_cast<int32_t>(retained_path_limit),
+                            /* .n_max   = */ static_cast<int32_t>(max_depth),
+                            /* .n_past  = */ next_position_,
+                            /* .id_last = */ pending_token_,
+                            /* .prompt  = */ &ngram_history_,
+                        },
+                        ngram_native_tree_draft_);
 
-    const auto tree =
-            server_ngram_build_candidate_tree(
-                    pending_token_,
-                    lookup,
-                    TREE_NODE_BUDGET,
-                    max_depth,
-                    eos_token);
+        if (!drafted) {
+            fprintf(stderr,
+                    "NGRAM_SPEC_MISS: mode=tree framework=native "
+                    "position=%d history=%zu\n",
+                    (int) next_position_,
+                    ngram_history_.size());
+            return false;
+        }
+
+        tree.matched_prefix_length =
+                ngram_native_tree_draft_
+                        .matched_prefix_length;
+        tree.source_suffix_count =
+                ngram_native_tree_draft_
+                        .retained_path_count;
+        tree.nodes.reserve(
+                ngram_native_tree_draft_.nodes.size());
+
+        for (const auto & native_node :
+                ngram_native_tree_draft_.nodes) {
+            server_ngram_tree_node node;
+            node.token = native_node.token;
+            node.parent = native_node.parent;
+            node.weight = native_node.score;
+            node.children = native_node.children;
+
+            if (node.parent >= 0) {
+                if (static_cast<size_t>(node.parent) >=
+                        tree.nodes.size()) {
+                    throw std::runtime_error(
+                            "native N-Gram tree is not parent-before-child");
+                }
+
+                node.depth =
+                        tree.nodes[node.parent].depth + 1;
+            }
+
+            tree.nodes.push_back(
+                    std::move(node));
+        }
+    } else {
+        auto lookup =
+                ngram_trie_.lookup(
+                        ngram_history_,
+                        pending_token_);
+
+        const size_t min_prefix_length =
+                ngram_min_prefix_length_;
+
+        if (!lookup.suffixes.empty() &&
+                lookup.matched_prefix_length <
+                        min_prefix_length) {
+            fprintf(
+                    stderr,
+                    "NGRAM_SPEC_PREFIX_REJECT: "
+                    "position=%d history=%zu "
+                    "matched_prefix=%u min_prefix=%zu\n",
+                    (int) next_position_,
+                    ngram_history_.size(),
+                    lookup.matched_prefix_length,
+                    min_prefix_length);
+
+            return false;
+        }
+
+        // Trie lookup is already frequency-first. Retain at most B complete
+        // suffix paths before merging their shared prefixes into the tree.
+        if (lookup.suffixes.size() >
+                retained_path_limit) {
+            lookup.suffixes.resize(
+                    retained_path_limit);
+        }
+
+        if (lookup.suffixes.empty()) {
+            fprintf(stderr,
+                    "NGRAM_SPEC_MISS: mode=tree framework=custom "
+                    "position=%d history=%zu\n",
+                    (int) next_position_,
+                    ngram_history_.size());
+            return false;
+        }
+
+        tree =
+                server_ngram_build_candidate_tree(
+                        pending_token_,
+                        lookup,
+                        1 +
+                                retained_path_limit *
+                                max_depth,
+                        max_depth,
+                        llama_vocab_eos(vocab));
+    }
 
     if (!tree.hit()) {
         return false;
     }
+
+    // seq0 plus one temporary sequence per retained suffix path. Shared
+    // prefixes can reduce the actual leaf/temporary-sequence count.
+    const size_t TREE_SEQ_BUDGET =
+            retained_path_limit + 1;
 
     server_ngram_verification_plan plan;
 
@@ -1851,7 +2090,7 @@ try_ngram_tree_speculative_round(
                 "NGRAM_SPEC_PLAN_FALLBACK: "
                 "nodes=%zu matched_prefix=%u\n",
                 tree.nodes.size(),
-                lookup.matched_prefix_length);
+                tree.matched_prefix_length);
         return false;
     }
 
@@ -1990,65 +2229,93 @@ try_ngram_tree_speculative_round(
         llama_token next_pending =
                 LLAMA_TOKEN_NULL;
 
-        while (true) {
-            if (current_node < 0 ||
-                    static_cast<size_t>(current_node) >=
-                            tree.nodes.size()) {
-                throw std::runtime_error(
-                        "N-Gram verifier reached invalid tree node");
-            }
-
-            // Every tree node requested logits, so output row i corresponds
-            // directly to candidate-tree node i.
-            const llama_token sampled =
-                    common_sampler_sample(
+        if (ngram_native_framework_) {
+            auto native_result =
+                    common_speculative_sample_and_accept_tree(
                             sampler_work.get(),
                             ctx_.get(),
-                            node_to_batch_row[current_node]);
+                            ngram_native_tree_draft_,
+                            node_to_batch_row);
 
-            common_sampler_accept(
-                    sampler_work.get(),
-                    sampled,
-                    true);
+            produced =
+                    std::move(native_result.tokens);
+            current_node =
+                    native_result.last_accepted_node;
 
-            produced.push_back(sampled);
-
-            // Match normal server semantics: an EOG token is returned to the
-            // caller but is not speculatively committed as another KV token.
-            if (llama_vocab_is_eog(
-                        vocab,
-                        sampled)) {
-                next_pending = sampled;
-                break;
-            }
-
-            int32_t matched_child = -1;
-
-            for (const int32_t child :
-                    tree.nodes[current_node].children) {
-                if (child < 0 ||
-                        static_cast<size_t>(child) >=
+            for (const int32_t accepted_node :
+                    native_result.accepted_nodes) {
+                if (accepted_node <= 0 ||
+                        static_cast<size_t>(accepted_node) >=
                                 tree.nodes.size()) {
                     throw std::runtime_error(
-                            "N-Gram verifier tree contains invalid child");
+                            "native N-Gram verifier returned an invalid accepted node");
                 }
 
-                if (tree.nodes[child].token ==
-                        sampled) {
-                    matched_child = child;
+                committed.push_back(
+                        tree.nodes[accepted_node].token);
+            }
+
+            if (!produced.empty()) {
+                next_pending =
+                        produced.back();
+            }
+        } else {
+            while (true) {
+                if (current_node < 0 ||
+                        static_cast<size_t>(current_node) >=
+                                tree.nodes.size()) {
+                    throw std::runtime_error(
+                            "N-Gram verifier reached invalid tree node");
+                }
+
+                // Every tree node requested logits, so output row i
+                // corresponds directly to candidate-tree node i.
+                const llama_token sampled =
+                        common_sampler_sample(
+                                sampler_work.get(),
+                                ctx_.get(),
+                                node_to_batch_row[current_node]);
+
+                common_sampler_accept(
+                        sampler_work.get(),
+                        sampled,
+                        true);
+
+                produced.push_back(sampled);
+
+                if (llama_vocab_is_eog(
+                            vocab,
+                            sampled)) {
+                    next_pending = sampled;
                     break;
                 }
-            }
 
-            if (matched_child < 0) {
-                // Verifier disagreed with every N-Gram branch. The sampled
-                // token becomes the next normal pending token.
-                next_pending = sampled;
-                break;
-            }
+                int32_t matched_child = -1;
 
-            committed.push_back(sampled);
-            current_node = matched_child;
+                for (const int32_t child :
+                        tree.nodes[current_node].children) {
+                    if (child < 0 ||
+                            static_cast<size_t>(child) >=
+                                    tree.nodes.size()) {
+                        throw std::runtime_error(
+                                "N-Gram verifier tree contains invalid child");
+                    }
+
+                    if (tree.nodes[child].token ==
+                            sampled) {
+                        matched_child = child;
+                        break;
+                    }
+                }
+
+                if (matched_child < 0) {
+                    next_pending = sampled;
+                    break;
+                }
+
+                committed.push_back(sampled);
+                current_node = matched_child;
+            }
         }
 
         if (next_pending == LLAMA_TOKEN_NULL ||
@@ -2056,6 +2323,25 @@ try_ngram_tree_speculative_round(
                 produced.empty()) {
             throw std::runtime_error(
                     "N-Gram verifier produced an invalid result");
+        }
+
+        if (ngram_diag_enabled()) {
+            for (size_t i = 0;
+                    i < produced.size();
+                    ++i) {
+                fprintf(
+                        stderr,
+                        "NGRAM_DIAG_TREE_SAMPLE: "
+                        "framework=%s position=%d step=%zu "
+                        "sampled=%d accepted=%d\n",
+                        ngram_native_framework_ ? "native" : "custom",
+                        (int) (
+                                next_position_ +
+                                static_cast<llama_pos>(i)),
+                        i,
+                        (int) produced[i],
+                        i + 1 < committed.size() ? 1 : 0);
+            }
         }
 
         // Any descendant leaf sequence below current_node contains the KV
@@ -2113,6 +2399,14 @@ try_ngram_tree_speculative_round(
         // have both succeeded.
         sampler_ = std::move(sampler_work);
 
+        if (ngram_native_framework_) {
+            common_speculative_accept(
+                    ngram_native_spec_.get(),
+                    sequence_id_,
+                    static_cast<uint16_t>(
+                            committed.size() - 1));
+        }
+
         ready_tokens_.clear();
 
         // produced contains:
@@ -2128,16 +2422,17 @@ try_ngram_tree_speculative_round(
         }
 
         fprintf(stderr,
-                "NGRAM_SPEC_ROUND: mode=tree position=%d "
-                "matched_prefix=%u suffixes=%zu "
+                "NGRAM_SPEC_ROUND: mode=tree framework=%s position=%d "
+                "matched_prefix=%u retained_paths=%zu "
                 "tree_nodes=%zu branches=%zu "
                 "accepted_draft=%zu committed=%zu "
                 "queued=%zu until_opt=%u remaining=%d\n",
+                ngram_native_framework_ ? "native" : "custom",
                 (int) (next_position_ -
                         static_cast<llama_pos>(
                                 committed.size())),
-                lookup.matched_prefix_length,
-                lookup.suffixes.size(),
+                tree.matched_prefix_length,
+                tree.source_suffix_count,
                 tree.nodes.size(),
                 plan.branch_count(),
                 committed.size() - 1,
@@ -2167,10 +2462,14 @@ void server_generation_decode_executor::reset() {
     }
     ngram_native_spec_.reset();
     ngram_native_draft_.clear();
+    ngram_native_tree_draft_.clear();
     ngram_last_matched_prefix_ = 0;
     ngram_last_draft_frequency_ = 0;
     ngram_last_suffix_count_ = 0;
     ngram_native_framework_ = true;
+    ngram_min_prefix_length_ = 1;
+    ngram_max_branches_ = 3;
+    ngram_max_draft_ = 3;
     ngram_history_.clear();
     ngram_trie_.clear();
     ngram_ready_ = false;

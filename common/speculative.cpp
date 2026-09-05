@@ -167,6 +167,11 @@ struct common_speculative_impl {
 
     virtual void draft(common_speculative_draft_params_vec & dparams) = 0;
 
+    virtual void draft_tree(
+            llama_seq_id /*seq_id*/,
+            const common_speculative_tree_draft_params & /*params*/,
+            common_speculative_tree_draft & /*result*/) {}
+
     virtual void accept(llama_seq_id seq_id, uint16_t n_accepted, bool is_other) = 0;
 
     // (optional) serialize/restore per-seq internal state (e.g. eagle3's deferred boundary).
@@ -190,7 +195,7 @@ struct common_speculative_impl_external : public common_speculative_impl {
     common_speculative_impl_external(common_speculative_external callbacks, uint32_t n_seq)
         : common_speculative_impl(COMMON_SPECULATIVE_TYPE_NONE, n_seq, callbacks.name)
         , callbacks(std::move(callbacks)) {
-        if (!this->callbacks.draft) {
+        if (!this->callbacks.draft && !this->callbacks.draft_tree) {
             throw std::invalid_argument("external speculative implementation requires a draft callback");
         }
     }
@@ -206,11 +211,24 @@ struct common_speculative_impl_external : public common_speculative_impl {
     }
 
     void draft(common_speculative_draft_params_vec & dparams) override {
+        if (!callbacks.draft) {
+            return;
+        }
+
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
             auto & dp = dparams[seq_id];
             if (dp.drafting) {
                 callbacks.draft(seq_id, dp, *dp.result);
             }
+        }
+    }
+
+    void draft_tree(
+            llama_seq_id seq_id,
+            const common_speculative_tree_draft_params & params,
+            common_speculative_tree_draft & result) override {
+        if (callbacks.draft_tree) {
+            callbacks.draft_tree(seq_id, params, result);
         }
     }
 
@@ -2537,6 +2555,133 @@ common_speculative * common_speculative_init_external(
         /* .impls     = */ std::move(impls),
         /* .impl_last = */ std::vector<common_speculative_impl *>(n_seq, nullptr),
     };
+}
+
+bool common_speculative_draft_tree(
+        common_speculative * spec,
+        llama_seq_id seq_id,
+        const common_speculative_tree_draft_params & params,
+        common_speculative_tree_draft & result) {
+    result.clear();
+
+    if (spec == nullptr ||
+            seq_id < 0 ||
+            seq_id >= (llama_seq_id) spec->impl_last.size() ||
+            params.n_paths <= 0 ||
+            params.n_max <= 0 ||
+            params.prompt == nullptr ||
+            params.id_last == LLAMA_TOKEN_NULL) {
+        return false;
+    }
+
+    for (auto & impl : spec->impls) {
+        {
+            common_time_meas tm(impl->t_draft_us, !impl->gen_perf);
+            impl->draft_tree(seq_id, params, result);
+            impl->n_call_draft++;
+        }
+
+        if (!result.hit()) {
+            result.clear();
+            continue;
+        }
+
+        spec->impl_last[seq_id] = impl.get();
+        impl->n_gen_drafts++;
+        impl->n_gen_tokens += result.speculative_node_count();
+
+        return true;
+    }
+
+    return false;
+}
+
+common_speculative_tree_accept_result common_speculative_sample_and_accept_tree(
+        common_sampler * sampler,
+        llama_context * ctx,
+        const common_speculative_tree_draft & tree,
+        const std::vector<int32_t> & node_to_batch_row) {
+    if (sampler == nullptr ||
+            ctx == nullptr ||
+            tree.nodes.empty() ||
+            node_to_batch_row.size() != tree.nodes.size()) {
+        throw std::invalid_argument("invalid native speculative tree verification input");
+    }
+
+    const llama_vocab * vocab =
+            llama_model_get_vocab(
+                    llama_get_model(ctx));
+
+    if (vocab == nullptr) {
+        throw std::runtime_error("native speculative tree verification has no vocabulary");
+    }
+
+    common_speculative_tree_accept_result result;
+    result.tokens.reserve(tree.nodes.size());
+    result.accepted_nodes.reserve(tree.nodes.size() - 1);
+
+    int32_t current_node = 0;
+
+    while (true) {
+        if (current_node < 0 ||
+                static_cast<size_t>(current_node) >= tree.nodes.size()) {
+            throw std::runtime_error("native speculative tree reached an invalid node");
+        }
+
+        const int32_t batch_row =
+                node_to_batch_row[current_node];
+
+        if (batch_row < 0) {
+            throw std::runtime_error("native speculative tree node has no verification row");
+        }
+
+        const llama_token sampled =
+                common_sampler_sample(
+                        sampler,
+                        ctx,
+                        batch_row);
+
+        common_sampler_accept(
+                sampler,
+                sampled,
+                true);
+
+        result.tokens.push_back(sampled);
+
+        if (llama_vocab_is_eog(vocab, sampled)) {
+            break;
+        }
+
+        int32_t matched_child = -1;
+
+        for (const int32_t child :
+                tree.nodes[current_node].children) {
+            if (child <= 0 ||
+                    static_cast<size_t>(child) >= tree.nodes.size() ||
+                    tree.nodes[child].parent != current_node) {
+                throw std::runtime_error("native speculative tree contains an invalid child");
+            }
+
+            if (tree.nodes[child].token == sampled) {
+                matched_child = child;
+                break;
+            }
+        }
+
+        if (matched_child < 0) {
+            break;
+        }
+
+        result.accepted_nodes.push_back(matched_child);
+        result.last_accepted_node = matched_child;
+        current_node = matched_child;
+
+        if (result.accepted_nodes.size() >= tree.nodes.size()) {
+            throw std::runtime_error("native speculative tree contains a cycle");
+        }
+    }
+
+    return result;
 }
 
 void common_speculative_free(common_speculative * spec) {

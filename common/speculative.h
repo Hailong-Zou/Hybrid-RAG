@@ -6,6 +6,7 @@
 #include <functional>
 
 struct common_speculative;
+struct common_sampler;
 
 // comma separated list the provided types
 std::string common_speculative_type_name_str(const std::vector<enum common_speculative_type> & types);
@@ -52,12 +53,59 @@ struct common_speculative_draft_params {
     llama_tokens * result;
 };
 
+// Generic shared-prefix speculative tree.
+//
+// node 0 is the already-sampled root token. Every other node is one
+// speculative token, identified by its full parent path. n_paths limits the
+// retained candidate suffix paths, not the number of children of a node.
+struct common_speculative_tree_node {
+    llama_token token = LLAMA_TOKEN_NULL;
+    int32_t parent = -1;
+    uint64_t score = 0;
+    std::vector<int32_t> children;
+};
+
+struct common_speculative_tree_draft {
+    std::vector<common_speculative_tree_node> nodes;
+    uint32_t matched_prefix_length = 0;
+    size_t retained_path_count = 0;
+
+    bool hit() const noexcept {
+        return nodes.size() > 1;
+    }
+
+    size_t speculative_node_count() const noexcept {
+        return nodes.empty() ? 0 : nodes.size() - 1;
+    }
+
+    void clear() {
+        nodes.clear();
+        matched_prefix_length = 0;
+        retained_path_count = 0;
+    }
+};
+
+struct common_speculative_tree_draft_params {
+    int32_t n_paths = 1;
+    int32_t n_max = 1;
+    llama_pos n_past = 0;
+    llama_token id_last = LLAMA_TOKEN_NULL;
+    const llama_tokens * prompt = nullptr;
+};
+
+struct common_speculative_tree_accept_result {
+    llama_tokens tokens;
+    std::vector<int32_t> accepted_nodes;
+    int32_t last_accepted_node = 0;
+};
+
 struct common_speculative_external {
     std::string name;
 
     std::function<void(llama_seq_id, const llama_tokens &)> begin;
     std::function<bool(const llama_batch &)> process;
     std::function<void(llama_seq_id, const common_speculative_draft_params &, llama_tokens &)> draft;
+    std::function<void(llama_seq_id, const common_speculative_tree_draft_params &, common_speculative_tree_draft &)> draft_tree;
     std::function<void(llama_seq_id, uint16_t, bool)> accept;
 
     bool need_embd = false;
@@ -67,6 +115,18 @@ struct common_speculative_external {
 common_speculative * common_speculative_init_external(
         common_speculative_external callbacks,
         uint32_t n_seq);
+
+bool common_speculative_draft_tree(
+        common_speculative * spec,
+        llama_seq_id seq_id,
+        const common_speculative_tree_draft_params & params,
+        common_speculative_tree_draft & result);
+
+common_speculative_tree_accept_result common_speculative_sample_and_accept_tree(
+        common_sampler * sampler,
+        llama_context * ctx,
+        const common_speculative_tree_draft & tree,
+        const std::vector<int32_t> & node_to_batch_row);
 
 common_speculative_draft_params & common_speculative_get_draft_params(common_speculative * spec, llama_seq_id seq_id);
 

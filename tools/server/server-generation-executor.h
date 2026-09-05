@@ -83,6 +83,14 @@ private:
     bool ngram_spec_enabled_ = false;
     bool ngram_native_framework_ = true;
 
+    // Per-request N-Gram runtime configuration snapshot.
+    //
+    // Runtime configuration files may change between requests, but one
+    // Decode request keeps a consistent configuration from start to finish.
+    size_t ngram_min_prefix_length_ = 1;
+    size_t ngram_max_branches_ = 3;
+    size_t ngram_max_draft_ = 3;
+
     // Prompt-local N-Gram draft source. It is built once from the transferred
     // Prompt and remains static for the whole request.
     server_ngram_trie ngram_trie_;
@@ -91,6 +99,7 @@ private:
 
     common_speculative_ptr ngram_native_spec_;
     llama_tokens ngram_native_draft_;
+    common_speculative_tree_draft ngram_native_tree_draft_;
     uint32_t ngram_last_matched_prefix_ = 0;
     uint32_t ngram_last_draft_frequency_ = 0;
     size_t ngram_last_suffix_count_ = 0;
@@ -122,4 +131,9 @@ private:
             llama_seq_id seq_id,
             const common_speculative_draft_params & params,
             llama_tokens & result);
+
+    void draft_ngram_tree_native(
+            llama_seq_id seq_id,
+            const common_speculative_tree_draft_params & params,
+            common_speculative_tree_draft & result);
 };
