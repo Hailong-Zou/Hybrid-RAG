@@ -7,6 +7,7 @@
 #include "ngram-cache.h"
 #include "ngram-map.h"
 #include "ngram-mod.h"
+#include "ngram-trie.h"
 #include "sampling.h"
 
 #include "../src/llama-ext.h" // staging API: llama_set_embeddings_nextn / llama_get_embeddings_nextn_ith (used by MTP)
@@ -38,7 +39,8 @@ const std::map<std::string, common_speculative_type> common_speculative_type_fro
     {"ngram-map-k",   COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K},
     {"ngram-map-k4v", COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V},
     {"ngram-mod",     COMMON_SPECULATIVE_TYPE_NGRAM_MOD},
-    {"ngram-cache",   COMMON_SPECULATIVE_TYPE_NGRAM_CACHE}
+    {"ngram-cache",   COMMON_SPECULATIVE_TYPE_NGRAM_CACHE},
+    {"ngram-trie",    COMMON_SPECULATIVE_TYPE_NGRAM_TRIE}
 };
 
 static std::string common_speculative_get_devices_str(const std::vector<ggml_backend_dev_t> & devices) {
@@ -2146,6 +2148,146 @@ struct common_speculative_impl_ngram_cache : public common_speculative_impl {
     }
 };
 
+struct common_speculative_impl_ngram_trie : public common_speculative_impl {
+    common_params_speculative_ngram_trie params;
+    std::vector<common_ngram_trie> tries;
+    std::vector<bool> ready;
+    std::vector<bool> tree_draft_logged;
+
+    common_speculative_impl_ngram_trie(
+            const common_params_speculative & params,
+            uint32_t n_seq)
+        : common_speculative_impl(COMMON_SPECULATIVE_TYPE_NGRAM_TRIE, n_seq)
+        , params(params.ngram_trie) {
+        if (this->params.size_n == 0 ||
+                this->params.prefix_length == 0 ||
+                this->params.prefix_length >= this->params.size_n ||
+                this->params.min_prefix == 0 ||
+                this->params.min_prefix > this->params.prefix_length ||
+                this->params.lookup_window == 0) {
+            throw std::invalid_argument("invalid ngram-trie speculative configuration");
+        }
+
+        tries.reserve(n_seq);
+        for (uint32_t i = 0; i < n_seq; ++i) {
+            tries.emplace_back(
+                    this->params.size_n,
+                    this->params.prefix_length,
+                    this->params.lookup_window);
+        }
+        ready.assign(n_seq, false);
+        tree_draft_logged.assign(n_seq, false);
+
+        SPC_TRC("adding speculative implementation 'ngram-trie': n=%u prefix=%u min_prefix=%u lookup_window=%u\n",
+                this->params.size_n,
+                this->params.prefix_length,
+                this->params.min_prefix,
+                this->params.lookup_window);
+    }
+
+    void begin(llama_seq_id seq_id, const llama_tokens & prompt) override {
+        if (seq_id < 0 || seq_id >= static_cast<llama_seq_id>(n_seq)) {
+            throw std::out_of_range("ngram-trie sequence id is out of range");
+        }
+
+        ready[seq_id] = tries[seq_id].build(prompt, params.eos_token);
+        tree_draft_logged[seq_id] = false;
+        if (!ready[seq_id]) {
+            throw std::runtime_error("failed to build prompt-local ngram-trie");
+        }
+
+        SPC_INF("backend=ngram-trie phase=begin seq=%d prompt_tokens=%zu entries=%zu nodes=%zu\n",
+                seq_id,
+                prompt.size(),
+                tries[seq_id].entry_count(),
+                tries[seq_id].node_count());
+    }
+
+    bool process(const llama_batch & /*batch*/) override {
+        return true;
+    }
+
+    void draft(common_speculative_draft_params_vec & dparams) override {
+        assert(dparams.size() == n_seq);
+
+        for (llama_seq_id seq_id = 0; seq_id < static_cast<llama_seq_id>(n_seq); ++seq_id) {
+            auto & dp = dparams[seq_id];
+            if (!dp.drafting || !ready[seq_id] || dp.prompt == nullptr || dp.result == nullptr) {
+                continue;
+            }
+
+            auto & result = *dp.result;
+            const auto lookup = tries[seq_id].lookup(*dp.prompt, dp.id_last);
+
+            if (lookup.matched_prefix_length < params.min_prefix) {
+                continue;
+            }
+
+            const common_ngram_trie_suffix * selected = nullptr;
+            for (const auto & suffix : lookup.suffixes) {
+                if (!suffix.tokens.empty() && suffix.frequency > 0) {
+                    selected = &suffix;
+                    break;
+                }
+            }
+
+            if (selected == nullptr) {
+                continue;
+            }
+
+            size_t n_max = selected->tokens.size();
+            if (dp.n_max >= 0) {
+                n_max = std::min(n_max, static_cast<size_t>(dp.n_max));
+            }
+
+            result.reserve(n_max);
+            for (const llama_token token : selected->tokens) {
+                if (result.size() >= n_max ||
+                        token == LLAMA_TOKEN_NULL ||
+                        token == params.eos_token) {
+                    break;
+                }
+                result.push_back(token);
+            }
+        }
+    }
+
+    void draft_tree(
+            llama_seq_id seq_id,
+            const common_speculative_tree_draft_params & draft_params,
+            common_speculative_tree_draft & result) override {
+        if (seq_id < 0 ||
+                seq_id >= static_cast<llama_seq_id>(n_seq) ||
+                !ready[seq_id]) {
+            result.clear();
+            return;
+        }
+
+        tries[seq_id].draft_tree(
+                draft_params,
+                params.min_prefix,
+                params.eos_token,
+                result);
+
+        if (result.hit() && !tree_draft_logged[seq_id]) {
+            tree_draft_logged[seq_id] = true;
+            SPC_INF("backend=ngram-trie phase=tree-draft seq=%d matched_prefix=%u retained_paths=%zu nodes=%zu\n",
+                    seq_id,
+                    result.matched_prefix_length,
+                    result.retained_path_count,
+                    result.nodes.size());
+        }
+    }
+
+    void accept(llama_seq_id /*seq_id*/, uint16_t /*n_accepted*/, bool /*is_other*/) override {
+        // Prompt-local Trie is immutable during one request.
+    }
+
+    bool need_embd() const override {
+        return false;
+    }
+};
+
 struct common_speculative {
     common_speculative_draft_params_vec dparams;
 
@@ -2219,6 +2361,7 @@ std::string common_speculative_type_to_str(common_speculative_type type) {
         case COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V: return "ngram-map-k4v";
         case COMMON_SPECULATIVE_TYPE_NGRAM_MOD:     return "ngram-mod";
         case COMMON_SPECULATIVE_TYPE_NGRAM_CACHE:   return "ngram-cache";
+        case COMMON_SPECULATIVE_TYPE_NGRAM_TRIE:    return "ngram-trie";
         default:                                    return "unknown";
     }
 }
@@ -2283,6 +2426,9 @@ int32_t common_speculative_n_max(const common_params_speculative * spec) {
                 break;
             case COMMON_SPECULATIVE_TYPE_NGRAM_CACHE:
                 n_max = std::max(n_max, (int32_t) 8);
+                break;
+            case COMMON_SPECULATIVE_TYPE_NGRAM_TRIE:
+                n_max = std::max(n_max, std::max(0, spec->ngram_trie.n_max));
                 break;
             case COMMON_SPECULATIVE_TYPE_NONE:
             case COMMON_SPECULATIVE_TYPE_COUNT:
@@ -2419,9 +2565,10 @@ common_speculative * common_speculative_init(common_params_speculative & params,
         bool has_ngram_map_k   = (enabled_configs & (1u << COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K));
         bool has_ngram_map_k4v = (enabled_configs & (1u << COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V));
         bool has_ngram_mod     = (enabled_configs & (1u << COMMON_SPECULATIVE_TYPE_NGRAM_MOD));
+        bool has_ngram_trie    = (enabled_configs & (1u << COMMON_SPECULATIVE_TYPE_NGRAM_TRIE));
 
         // when adding a new type - update here the logic above
-        static_assert(COMMON_SPECULATIVE_TYPE_COUNT == 10);
+        static_assert(COMMON_SPECULATIVE_TYPE_COUNT == 11);
 
         // this list here defines the priority of the speculators
         // the one with highest priority are listed first
@@ -2441,6 +2588,9 @@ common_speculative * common_speculative_init(common_params_speculative & params,
         }
         if (has_ngram_cache) {
             configs.push_back(common_speculative_config(COMMON_SPECULATIVE_TYPE_NGRAM_CACHE, params));
+        }
+        if (has_ngram_trie) {
+            configs.push_back(common_speculative_config(COMMON_SPECULATIVE_TYPE_NGRAM_TRIE, params));
         }
         if (has_draft_simple) {
             configs.push_back(common_speculative_config(COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE, params));
@@ -2519,6 +2669,13 @@ common_speculative * common_speculative_init(common_params_speculative & params,
                         params.ngram_cache.lookup_cache_static,
                         params.ngram_cache.lookup_cache_dynamic);
                 impls.push_back(std::make_unique<common_speculative_impl_ngram_cache>(state));
+                break;
+            }
+            case COMMON_SPECULATIVE_TYPE_NGRAM_TRIE: {
+                impls.push_back(
+                        std::make_unique<common_speculative_impl_ngram_trie>(
+                            config.params,
+                            n_seq));
                 break;
             }
             default:

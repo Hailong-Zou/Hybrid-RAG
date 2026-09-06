@@ -885,16 +885,6 @@ llama_token server_generation_decode_executor::begin(
                             params,
                             result);
                 };
-                external.draft_tree = [this](
-                        llama_seq_id seq_id,
-                        const common_speculative_tree_draft_params & params,
-                        common_speculative_tree_draft & result) {
-                    draft_ngram_tree_native(
-                            seq_id,
-                            params,
-                            result);
-                };
-
                 ngram_native_spec_.reset(
                         common_speculative_init_external(
                                 std::move(external),
@@ -902,6 +892,37 @@ llama_token server_generation_decode_executor::begin(
 
                 common_speculative_begin(
                         ngram_native_spec_.get(),
+                        sequence_id_,
+                        ngram_history_);
+
+                common_params_speculative tree_params;
+                tree_params.types = {
+                    COMMON_SPECULATIVE_TYPE_NGRAM_TRIE
+                };
+                tree_params.ngram_trie.size_n =
+                        static_cast<uint32_t>(runtime_ngram_size);
+                tree_params.ngram_trie.prefix_length =
+                        static_cast<uint32_t>(runtime_prefix_length);
+                tree_params.ngram_trie.min_prefix =
+                        static_cast<uint32_t>(runtime_min_prefix_length);
+                tree_params.ngram_trie.lookup_window = 4;
+                tree_params.ngram_trie.n_max =
+                        static_cast<int32_t>(runtime_max_draft);
+                tree_params.ngram_trie.eos_token =
+                        llama_vocab_eos(vocab);
+
+                ngram_native_tree_spec_.reset(
+                        common_speculative_init(
+                                tree_params,
+                                1));
+
+                if (!ngram_native_tree_spec_) {
+                    throw std::runtime_error(
+                            "failed to initialize common ngram-trie backend");
+                }
+
+                common_speculative_begin(
+                        ngram_native_tree_spec_.get(),
                         sequence_id_,
                         ngram_history_);
             }
@@ -1155,113 +1176,6 @@ draft_ngram_linear_native(
         }
 
         result.push_back(token);
-    }
-}
-
-void
-server_generation_decode_executor::
-draft_ngram_tree_native(
-        llama_seq_id seq_id,
-        const common_speculative_tree_draft_params & params,
-        common_speculative_tree_draft & result) {
-    result.clear();
-
-    if (!ngram_ready_ ||
-            seq_id != sequence_id_ ||
-            params.prompt == nullptr ||
-            params.id_last == LLAMA_TOKEN_NULL ||
-            params.n_paths <= 0 ||
-            params.n_max <= 0) {
-        return;
-    }
-
-    auto lookup =
-            ngram_trie_.lookup(
-                    *params.prompt,
-                    params.id_last);
-
-    result.matched_prefix_length =
-            lookup.matched_prefix_length;
-
-    const size_t min_prefix_length =
-            ngram_min_prefix_length_;
-
-    if (!lookup.suffixes.empty() &&
-            lookup.matched_prefix_length <
-                    min_prefix_length) {
-        fprintf(
-                stderr,
-                "NGRAM_SPEC_PREFIX_REJECT: "
-                "position=%d history=%zu "
-                "matched_prefix=%u min_prefix=%zu\n",
-                (int) params.n_past,
-                params.prompt->size(),
-                lookup.matched_prefix_length,
-                min_prefix_length);
-
-        return;
-    }
-
-    const size_t retained_path_limit =
-            static_cast<size_t>(
-                    params.n_paths);
-
-    if (lookup.suffixes.size() >
-            retained_path_limit) {
-        lookup.suffixes.resize(
-                retained_path_limit);
-    }
-
-    if (lookup.suffixes.empty()) {
-        return;
-    }
-
-    result.retained_path_count =
-            lookup.suffixes.size();
-
-    const size_t max_depth =
-            static_cast<size_t>(
-                    params.n_max);
-
-    const size_t node_budget =
-            1 +
-            result.retained_path_count *
-                    max_depth;
-
-    const llama_vocab * vocab =
-            llama_model_get_vocab(model_);
-
-    if (vocab == nullptr) {
-        throw std::runtime_error(
-                "cannot build native N-Gram tree without vocabulary");
-    }
-
-    const auto server_tree =
-            server_ngram_build_candidate_tree(
-                    params.id_last,
-                    lookup,
-                    node_budget,
-                    max_depth,
-                    llama_vocab_eos(vocab));
-
-    if (!server_tree.hit()) {
-        result.clear();
-        return;
-    }
-
-    result.nodes.reserve(
-            server_tree.nodes.size());
-
-    for (const auto & node :
-            server_tree.nodes) {
-        common_speculative_tree_node native_node;
-        native_node.token = node.token;
-        native_node.parent = node.parent;
-        native_node.score = node.weight;
-        native_node.children = node.children;
-
-        result.nodes.push_back(
-                std::move(native_node));
     }
 }
 
@@ -1961,13 +1875,13 @@ try_ngram_tree_speculative_round(
     server_ngram_candidate_tree tree;
 
     if (ngram_native_framework_) {
-        if (!ngram_native_spec_) {
+        if (!ngram_native_tree_spec_) {
             return false;
         }
 
         const bool drafted =
                 common_speculative_draft_tree(
-                        ngram_native_spec_.get(),
+                        ngram_native_tree_spec_.get(),
                         sequence_id_,
                         {
                             /* .n_paths = */ static_cast<int32_t>(retained_path_limit),
@@ -2401,7 +2315,7 @@ try_ngram_tree_speculative_round(
 
         if (ngram_native_framework_) {
             common_speculative_accept(
-                    ngram_native_spec_.get(),
+                    ngram_native_tree_spec_.get(),
                     sequence_id_,
                     static_cast<uint16_t>(
                             committed.size() - 1));
@@ -2461,6 +2375,11 @@ void server_generation_decode_executor::reset() {
                 ngram_native_spec_.get());
     }
     ngram_native_spec_.reset();
+    if (ngram_native_tree_spec_) {
+        common_speculative_print_stats(
+                ngram_native_tree_spec_.get());
+    }
+    ngram_native_tree_spec_.reset();
     ngram_native_draft_.clear();
     ngram_native_tree_draft_.clear();
     ngram_last_matched_prefix_ = 0;

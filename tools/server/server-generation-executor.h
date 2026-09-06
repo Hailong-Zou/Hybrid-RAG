@@ -98,6 +98,7 @@ private:
     bool ngram_ready_ = false;
 
     common_speculative_ptr ngram_native_spec_;
+    common_speculative_ptr ngram_native_tree_spec_;
     llama_tokens ngram_native_draft_;
     common_speculative_tree_draft ngram_native_tree_draft_;
     uint32_t ngram_last_matched_prefix_ = 0;
@@ -132,8 +133,4 @@ private:
             const common_speculative_draft_params & params,
             llama_tokens & result);
 
-    void draft_ngram_tree_native(
-            llama_seq_id seq_id,
-            const common_speculative_tree_draft_params & params,
-            common_speculative_tree_draft & result);
 };

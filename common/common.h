@@ -177,6 +177,7 @@ enum common_speculative_type {
     COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V, // self-speculative decoding with n-gram keys and 4 m-gram values
     COMMON_SPECULATIVE_TYPE_NGRAM_MOD,
     COMMON_SPECULATIVE_TYPE_NGRAM_CACHE,   // self-speculative decoding with 3-level n-gram cache
+    COMMON_SPECULATIVE_TYPE_NGRAM_TRIE,    // prompt-local longest-prefix n-gram Trie
     COMMON_SPECULATIVE_TYPE_COUNT          // number of types, unknown type
 };
 
@@ -368,6 +369,15 @@ struct common_params_speculative_ngram_cache {
     std::string lookup_cache_dynamic; // path of dynamic ngram cache file for lookup decoding
 };
 
+struct common_params_speculative_ngram_trie {
+    uint32_t size_n        = 13;
+    uint32_t prefix_length = 3;
+    uint32_t min_prefix    = 1;
+    uint32_t lookup_window = 4;
+    int32_t  n_max         = 3;
+    llama_token eos_token  = LLAMA_TOKEN_NULL;
+};
+
 struct common_params_speculative {
     std::vector<enum common_speculative_type> types = { COMMON_SPECULATIVE_TYPE_NONE };
 
@@ -380,6 +390,7 @@ struct common_params_speculative {
     common_params_speculative_ngram_map ngram_map_k4v;
 
     common_params_speculative_ngram_cache ngram_cache;
+    common_params_speculative_ngram_trie  ngram_trie;
 
     bool has_dft() const {
         return !draft.mparams.empty();
