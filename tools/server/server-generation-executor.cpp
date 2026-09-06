@@ -874,27 +874,6 @@ llama_token server_generation_decode_executor::begin(
                     ngram_trie_.node_count());
 
             if (ngram_native_framework_) {
-                common_speculative_external external;
-                external.name = "ngram-trie";
-                external.draft = [this](
-                        llama_seq_id seq_id,
-                        const common_speculative_draft_params & params,
-                        llama_tokens & result) {
-                    draft_ngram_linear_native(
-                            seq_id,
-                            params,
-                            result);
-                };
-                ngram_native_spec_.reset(
-                        common_speculative_init_external(
-                                std::move(external),
-                                1));
-
-                common_speculative_begin(
-                        ngram_native_spec_.get(),
-                        sequence_id_,
-                        ngram_history_);
-
                 common_params_speculative tree_params;
                 tree_params.types = {
                     COMMON_SPECULATIVE_TYPE_NGRAM_TRIE
@@ -1109,7 +1088,7 @@ server_generation_decode_executor::decode_next_sequential() {
 
 void
 server_generation_decode_executor::
-draft_ngram_linear_native(
+draft_ngram_linear_custom(
         llama_seq_id seq_id,
         const common_speculative_draft_params & params,
         llama_tokens & result) {
@@ -1319,18 +1298,52 @@ try_ngram_speculative_round(
     };
 
     if (ngram_native_framework_) {
-        if (!ngram_native_spec_) {
+        if (!ngram_native_tree_spec_) {
             return false;
         }
 
         common_speculative_get_draft_params(
-                ngram_native_spec_.get(),
+                ngram_native_tree_spec_.get(),
                 sequence_id_) = draft_params;
 
         common_speculative_draft(
-                ngram_native_spec_.get());
+                ngram_native_tree_spec_.get());
+
+        // Preserve the compatibility path's stop-token semantics. The common
+        // backend knows the configured EOS token; the target vocabulary may
+        // classify additional control tokens as end-of-generation tokens.
+        const llama_vocab * vocab =
+                llama_model_get_vocab(model_);
+        if (vocab == nullptr) {
+            draft_result->clear();
+        } else {
+            for (size_t i = 0; i < draft_result->size(); ++i) {
+                const llama_token token = (*draft_result)[i];
+                if (token == LLAMA_TOKEN_NULL ||
+                        llama_vocab_is_eog(vocab, token)) {
+                    draft_result->resize(i);
+                    break;
+                }
+            }
+        }
+
+        common_speculative_ngram_trie_draft_info draft_info;
+        if (!common_speculative_get_ngram_trie_draft_info(
+                    ngram_native_tree_spec_.get(),
+                    sequence_id_,
+                    draft_info)) {
+            throw std::runtime_error(
+                    "common ngram-trie backend did not expose linear draft metadata");
+        }
+
+        ngram_last_matched_prefix_ =
+                draft_info.matched_prefix_length;
+        ngram_last_draft_frequency_ =
+                draft_info.selected_frequency;
+        ngram_last_suffix_count_ =
+                draft_info.suffix_count;
     } else {
-        draft_ngram_linear_native(
+        draft_ngram_linear_custom(
                 sequence_id_,
                 draft_params,
                 *draft_result);
@@ -1705,7 +1718,7 @@ try_ngram_speculative_round(
 
         if (ngram_native_framework_) {
             common_speculative_accept(
-                    ngram_native_spec_.get(),
+                    ngram_native_tree_spec_.get(),
                     sequence_id_,
                     static_cast<uint16_t>(accepted_draft));
         }
@@ -2370,11 +2383,6 @@ try_ngram_tree_speculative_round(
 
 void server_generation_decode_executor::reset() {
     ready_tokens_.clear();
-    if (ngram_native_spec_) {
-        common_speculative_print_stats(
-                ngram_native_spec_.get());
-    }
-    ngram_native_spec_.reset();
     if (ngram_native_tree_spec_) {
         common_speculative_print_stats(
                 ngram_native_tree_spec_.get());

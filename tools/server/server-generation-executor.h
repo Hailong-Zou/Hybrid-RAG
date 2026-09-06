@@ -97,7 +97,6 @@ private:
     std::vector<llama_token> ngram_history_;
     bool ngram_ready_ = false;
 
-    common_speculative_ptr ngram_native_spec_;
     common_speculative_ptr ngram_native_tree_spec_;
     llama_tokens ngram_native_draft_;
     common_speculative_tree_draft ngram_native_tree_draft_;
@@ -128,7 +127,7 @@ private:
     bool try_ngram_tree_speculative_round(
             int32_t remaining_output_tokens);
 
-    void draft_ngram_linear_native(
+    void draft_ngram_linear_custom(
             llama_seq_id seq_id,
             const common_speculative_draft_params & params,
             llama_tokens & result);

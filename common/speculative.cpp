@@ -174,6 +174,10 @@ struct common_speculative_impl {
             const common_speculative_tree_draft_params & /*params*/,
             common_speculative_tree_draft & /*result*/) {}
 
+    virtual bool get_ngram_trie_draft_info(
+            llama_seq_id /*seq_id*/,
+            common_speculative_ngram_trie_draft_info & /*result*/) const { return false; }
+
     virtual void accept(llama_seq_id seq_id, uint16_t n_accepted, bool is_other) = 0;
 
     // (optional) serialize/restore per-seq internal state (e.g. eagle3's deferred boundary).
@@ -2152,7 +2156,9 @@ struct common_speculative_impl_ngram_trie : public common_speculative_impl {
     common_params_speculative_ngram_trie params;
     std::vector<common_ngram_trie> tries;
     std::vector<bool> ready;
+    std::vector<bool> linear_draft_logged;
     std::vector<bool> tree_draft_logged;
+    std::vector<common_speculative_ngram_trie_draft_info> linear_draft_info;
 
     common_speculative_impl_ngram_trie(
             const common_params_speculative & params,
@@ -2176,7 +2182,9 @@ struct common_speculative_impl_ngram_trie : public common_speculative_impl {
                     this->params.lookup_window);
         }
         ready.assign(n_seq, false);
+        linear_draft_logged.assign(n_seq, false);
         tree_draft_logged.assign(n_seq, false);
+        linear_draft_info.resize(n_seq);
 
         SPC_TRC("adding speculative implementation 'ngram-trie': n=%u prefix=%u min_prefix=%u lookup_window=%u\n",
                 this->params.size_n,
@@ -2191,7 +2199,9 @@ struct common_speculative_impl_ngram_trie : public common_speculative_impl {
         }
 
         ready[seq_id] = tries[seq_id].build(prompt, params.eos_token);
+        linear_draft_logged[seq_id] = false;
         tree_draft_logged[seq_id] = false;
+        linear_draft_info[seq_id] = {};
         if (!ready[seq_id]) {
             throw std::runtime_error("failed to build prompt-local ngram-trie");
         }
@@ -2212,12 +2222,17 @@ struct common_speculative_impl_ngram_trie : public common_speculative_impl {
 
         for (llama_seq_id seq_id = 0; seq_id < static_cast<llama_seq_id>(n_seq); ++seq_id) {
             auto & dp = dparams[seq_id];
+            linear_draft_info[seq_id] = {};
             if (!dp.drafting || !ready[seq_id] || dp.prompt == nullptr || dp.result == nullptr) {
                 continue;
             }
 
             auto & result = *dp.result;
             const auto lookup = tries[seq_id].lookup(*dp.prompt, dp.id_last);
+
+            auto & info = linear_draft_info[seq_id];
+            info.matched_prefix_length = lookup.matched_prefix_length;
+            info.suffix_count = lookup.suffixes.size();
 
             if (lookup.matched_prefix_length < params.min_prefix) {
                 continue;
@@ -2235,6 +2250,8 @@ struct common_speculative_impl_ngram_trie : public common_speculative_impl {
                 continue;
             }
 
+            info.selected_frequency = selected->frequency;
+
             size_t n_max = selected->tokens.size();
             if (dp.n_max >= 0) {
                 n_max = std::min(n_max, static_cast<size_t>(dp.n_max));
@@ -2249,7 +2266,28 @@ struct common_speculative_impl_ngram_trie : public common_speculative_impl {
                 }
                 result.push_back(token);
             }
+
+            if (!result.empty() && !linear_draft_logged[seq_id]) {
+                linear_draft_logged[seq_id] = true;
+                SPC_INF("backend=ngram-trie phase=linear-draft seq=%d matched_prefix=%u suffixes=%zu frequency=%u tokens=%zu\n",
+                        seq_id,
+                        info.matched_prefix_length,
+                        info.suffix_count,
+                        info.selected_frequency,
+                        result.size());
+            }
         }
+    }
+
+    bool get_ngram_trie_draft_info(
+            llama_seq_id seq_id,
+            common_speculative_ngram_trie_draft_info & result) const override {
+        if (seq_id < 0 || seq_id >= static_cast<llama_seq_id>(n_seq)) {
+            return false;
+        }
+
+        result = linear_draft_info[seq_id];
+        return true;
     }
 
     void draft_tree(
@@ -2905,6 +2943,23 @@ bool common_speculative_need_embd_nextn(common_speculative * spec) {
 
     for (auto & impl : spec->impls) {
         if (impl->need_embd_nextn()) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+bool common_speculative_get_ngram_trie_draft_info(
+        common_speculative * spec,
+        llama_seq_id seq_id,
+        common_speculative_ngram_trie_draft_info & result) {
+    if (spec == nullptr || seq_id < 0 || seq_id >= static_cast<llama_seq_id>(spec->dparams.size())) {
+        return false;
+    }
+
+    for (const auto & impl : spec->impls) {
+        if (impl->get_ngram_trie_draft_info(seq_id, result)) {
             return true;
         }
     }

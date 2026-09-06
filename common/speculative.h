@@ -99,6 +99,14 @@ struct common_speculative_tree_accept_result {
     int32_t last_accepted_node = 0;
 };
 
+// Metadata for the most recent prompt-local ngram-trie linear draft attempt.
+// This keeps server diagnostics independent of the backend implementation.
+struct common_speculative_ngram_trie_draft_info {
+    uint32_t matched_prefix_length = 0;
+    uint32_t selected_frequency = 0;
+    size_t suffix_count = 0;
+};
+
 struct common_speculative_external {
     std::string name;
 
@@ -121,6 +129,11 @@ bool common_speculative_draft_tree(
         llama_seq_id seq_id,
         const common_speculative_tree_draft_params & params,
         common_speculative_tree_draft & result);
+
+bool common_speculative_get_ngram_trie_draft_info(
+        common_speculative * spec,
+        llama_seq_id seq_id,
+        common_speculative_ngram_trie_draft_info & result);
 
 common_speculative_tree_accept_result common_speculative_sample_and_accept_tree(
         common_sampler * sampler,
