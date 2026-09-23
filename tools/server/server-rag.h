@@ -60,6 +60,7 @@ struct RagRequest {
     std::string mode = "sequential";
     bool enable_query_expansion = false;
     bool unload_expansion_model_after_use = false;
+    bool stage_model_residency = false;
 
     std::size_t max_expanded_queries = 3;
 

@@ -222,6 +222,10 @@ public:
     void unload(const std::string & name);
     void unload_all();
 
+    // Stop a model child and wait until the process has exited. This is used
+    // by the opt-in RAG stage-residency mode to make reclamation deterministic.
+    bool unload_and_wait(const std::string & name);
+
     struct update_status_args {
         server_model_status status;
         int exit_code = 0; // only valid if status == UNLOADED

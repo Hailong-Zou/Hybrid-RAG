@@ -2,6 +2,7 @@
 #include "server-models.h"
 
 #include <algorithm>
+#include <cinttypes>
 #include <numeric>
 #include <stdexcept>
 
@@ -9,6 +10,23 @@ RagServerExecutor::RagServerExecutor(server_models * models, RagTaskType type)
     : models_(models), type_(type) {}
 
 RagTaskResult RagServerExecutor::execute(const RagTaskContext & ctx) {
+    const auto stage_name = [](RagTaskType type) -> const char * {
+        switch (type) {
+            case RagTaskType::DocumentEmbedding: return "document_embedding";
+            case RagTaskType::QueryExpansion:    return "query_expansion";
+            case RagTaskType::QueryEmbedding:    return "query_embedding";
+            case RagTaskType::VectorSearch:      return "vector_search";
+            case RagTaskType::RetrievalMerge:    return "retrieval_merge";
+            case RagTaskType::Reranking:         return "reranking";
+            case RagTaskType::Generation:        return "generation";
+            case RagTaskType::GenerationPrefill: return "generation_prefill";
+            case RagTaskType::GenerationDecode:  return "generation_decode";
+            case RagTaskType::CandidateMerge:    return "candidate_merge";
+            case RagTaskType::Finalize:          return "finalize";
+        }
+        return "unknown";
+    };
+
     RagTaskResult result;
     result.task_id = ctx.task_id;
     auto * runtime = static_cast<RagRequestRuntime *>(ctx.runtime);
@@ -16,6 +34,15 @@ RagTaskResult RagServerExecutor::execute(const RagTaskContext & ctx) {
         result.error_message = "missing RAG runtime context";
         return result;
     }
+
+    SRV_INF(
+            "RAG_STAGE_BEGIN request=%" PRIu64 " task=%d stage=%s "
+            "query_index=%zu candidate_index=%zu\n",
+            runtime->request_id,
+            ctx.task_id,
+            stage_name(type_),
+            ctx.query_index,
+            ctx.candidate_index);
 
     try {
         const RagRequest & req = runtime->request;
@@ -46,6 +73,10 @@ RagTaskResult RagServerExecutor::execute(const RagTaskContext & ctx) {
 
                 runtime->document_embeddings.push_back(
                         std::move(embeddings.front()));
+            }
+
+            if (req.stage_model_residency) {
+                models_->unload_and_wait(req.embedding_model);
             }
         } else if (type_ == RagTaskType::QueryExpansion) {
             runtime->expanded_queries.clear();
@@ -151,6 +182,15 @@ RagTaskResult RagServerExecutor::execute(const RagTaskContext & ctx) {
             if (runtime->expanded_queries.empty()) {
                 runtime->expanded_queries.push_back(req.query);
             }
+
+            if (req.stage_model_residency &&
+                req.enable_query_expansion) {
+                const std::string model =
+                        req.expansion_model.empty()
+                                ? req.generation_model
+                                : req.expansion_model;
+                models_->unload_and_wait(model);
+            }
         } else if (type_ == RagTaskType::QueryEmbedding) {
             if (ctx.query_index == RAG_INVALID_INDEX ||
                 ctx.query_index >=
@@ -253,6 +293,10 @@ RagTaskResult RagServerExecutor::execute(const RagTaskContext & ctx) {
                     rag_merge_subquery_hits(
                             runtime->retrieval_results,
                             req.top_k);
+
+            if (req.stage_model_residency) {
+                models_->unload_and_wait(req.embedding_model);
+            }
         } else if (type_ == RagTaskType::Reranking) {
         std::vector<std::string> candidates;
 
@@ -284,6 +328,10 @@ RagTaskResult RagServerExecutor::execute(const RagTaskContext & ctx) {
                 }
             }
         }
+        if (req.stage_model_residency && !req.rerank_model.empty()) {
+            models_->unload_and_wait(req.rerank_model);
+        }
+
     } else if (
                 type_ == RagTaskType::GenerationPrefill) {
             if (ctx.candidate_index == RAG_INVALID_INDEX ||
@@ -957,5 +1005,14 @@ RagTaskResult RagServerExecutor::execute(const RagTaskContext & ctx) {
         }
         result.error_message = e.what();
     }
+
+    SRV_INF(
+            "RAG_STAGE_END request=%" PRIu64 " task=%d stage=%s "
+            "status=%s\n",
+            runtime->request_id,
+            ctx.task_id,
+            stage_name(type_),
+            result.success ? "success" : "error");
+
     return result;
 }

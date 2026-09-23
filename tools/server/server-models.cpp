@@ -813,6 +813,12 @@ void server_models::load(const std::string & name, const load_options & opts) {
             throw std::runtime_error("model limit reached, try again later");
         }
     }
+    SRV_INF(
+            "MODEL_LOAD_BEGIN model=%s weight_bytes=unavailable "
+            "backend_buffer_bytes=unavailable kv_bytes=unavailable "
+            "runtime_bytes=unavailable\n",
+            meta.name.c_str());
+
 
     // prepare new instance info
     instance_t inst;
@@ -1009,6 +1015,49 @@ void server_models::unload(const std::string & name) {
     }
 }
 
+bool server_models::unload_and_wait(const std::string & name) {
+    const auto meta = get_meta(name);
+    if (!meta.has_value()) {
+        throw std::runtime_error("model name=" + name + " is not found");
+    }
+
+    const std::string canonical_name = meta->name;
+    if (!meta->is_running()) {
+        return false;
+    }
+
+    SRV_INF(
+            "MODEL_UNLOAD_BEGIN model=%s weight_bytes=unavailable "
+            "backend_buffer_bytes=unavailable kv_bytes=unavailable "
+            "runtime_bytes=unavailable\n",
+            canonical_name.c_str());
+
+    unload(canonical_name);
+    wait(canonical_name, [](const server_model_meta & current) {
+        return current.status == SERVER_MODEL_STATUS_UNLOADED;
+    });
+
+    const auto final_meta = get_meta(canonical_name);
+    const int exit_code = final_meta.has_value()
+            ? final_meta->exit_code
+            : 0;
+
+    SRV_INF(
+            "MODEL_UNLOAD_END model=%s status=unloaded exit_code=%d "
+            "weight_bytes=unavailable backend_buffer_bytes=unavailable "
+            "kv_bytes=unavailable runtime_bytes=unavailable\n",
+            canonical_name.c_str(),
+            exit_code);
+
+    if (exit_code != 0) {
+        throw std::runtime_error(
+                "model name=" + canonical_name +
+                " exited with status " + std::to_string(exit_code));
+    }
+
+    return true;
+}
+
 void server_models::unload_all() {
     std::vector<std::thread> to_join;
     {
@@ -1187,9 +1236,11 @@ bool server_models::ensure_model_ready(const std::string & name) {
     if (meta->is_ready()) {
         return false; // ready for taking requests
     }
+
     if (meta->status == SERVER_MODEL_STATUS_SLEEPING) {
         return false; // child is sleeping but still running; new request will wake it up
     }
+
     if (meta->status == SERVER_MODEL_STATUS_UNLOADED) {
         SRV_INF("model name=%s is not loaded, loading...\n", name.c_str());
         load(name);
@@ -1586,6 +1637,7 @@ void server_models::handle_child_state(const std::string & name, const std::stri
             } break;
         case SERVER_STATE_READY:
             {
+                const auto before = get_meta(name);
                 update_status(name, {
                     SERVER_MODEL_STATUS_LOADED,
                     0,
@@ -1593,6 +1645,15 @@ void server_models::handle_child_state(const std::string & name, const std::stri
                     payload.size() > 0 ? payload : nullptr,
                     {}, // reset progress info
                 });
+                if (before.has_value() &&
+                    before->status == SERVER_MODEL_STATUS_LOADING) {
+                    SRV_INF(
+                            "MODEL_LOAD_END model=%s status=loaded "
+                            "weight_bytes=unavailable "
+                            "backend_buffer_bytes=unavailable "
+                            "kv_bytes=unavailable runtime_bytes=unavailable\n",
+                            before->name.c_str());
+                }
             } break;
         case SERVER_STATE_SLEEPING:
             {
@@ -2098,6 +2159,18 @@ void server_models_routes::init_routes() {
                             "enable_query_expansion",
                             false);
 
+            const char * stage_residency_env =
+                    std::getenv("LLAMA_RAG_STAGE_MODEL_RESIDENCY");
+            const bool stage_residency_default =
+                    stage_residency_env != nullptr &&
+                    std::strcmp(stage_residency_env, "1") == 0;
+
+            runtime->request.stage_model_residency =
+                    json_value(
+                            body,
+                            "stage_model_residency",
+                            stage_residency_default);
+
             runtime->request.max_expanded_queries =
                     json_value(
                             body,
@@ -2248,6 +2321,12 @@ void server_models_routes::init_routes() {
                     1,
                     RagTaskType::QueryExpansion,
                     RagBackend::CPU);
+
+            // The memory-baseline mode intentionally trades preparation
+            // latency for a single-model working set.
+            if (runtime->request.stage_model_residency) {
+                phase_a.add_dependency(0, 1);
+            }
 
             for (auto & node : phase_a.nodes) {
                 node.critical_score =
@@ -2596,6 +2675,10 @@ void server_models_routes::init_routes() {
                                 error,
                                 ERROR_TYPE_SERVER));
                 return res;
+            }
+
+            if (runtime->request.stage_model_residency) {
+                models.unload_and_wait(runtime->request.generation_model);
             }
 
             const auto task_type_name =

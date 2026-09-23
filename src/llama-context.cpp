@@ -68,6 +68,7 @@ struct llama_layer_chunk_offload {
     bool mmap_residency = false;
     bool repack_residency = false;
     bool repack_failed = false;
+    bool lifecycle_log_emitted = false;
 };
 
 // LLAMA_LAYER_CHUNKS_ADVICE=cold -> MADV_COLD (keep weights resident, faster gen),
@@ -128,6 +129,15 @@ static bool llama_eval_cb_layer_chunk_offload(ggml_tensor * t, bool ask, void * 
         if (d->mmap_residency && d->evict_advice != MADV_COLD) {
             int64_t t0 = ggml_time_us();
 
+            if (!d->lifecycle_log_emitted) {
+                fprintf(stderr,
+                        "LAYER_GROUP_UNLOAD_BEGIN group=%d range=%d:%d "
+                        "mechanism=madvise_pageout\n",
+                        c - 1,
+                        d->ranges[c - 1].first,
+                        d->ranges[c - 1].second);
+            }
+
             d->model->madvise_layer_weights(
                     d->ranges[c - 1].first,
                     d->ranges[c - 1].second,
@@ -135,6 +145,21 @@ static bool llama_eval_cb_layer_chunk_offload(ggml_tensor * t, bool ask, void * 
                     d->layer_skip);
 
             mmap_evict_ms = (ggml_time_us() - t0) / 1000.0;
+
+            if (!d->lifecycle_log_emitted) {
+                fprintf(stderr,
+                        "LAYER_GROUP_UNLOAD_END group=%d range=%d:%d "
+                        "mechanism=madvise_pageout completion=advised\n",
+                        c - 1,
+                        d->ranges[c - 1].first,
+                        d->ranges[c - 1].second);
+                fprintf(stderr,
+                        "LAYER_GROUP_LOAD_BEGIN group=%d range=%d:%d "
+                        "mechanism=madvise_willneed\n",
+                        c,
+                        d->ranges[c].first,
+                        d->ranges[c].second);
+            }
 
             t0 = ggml_time_us();
 
@@ -148,6 +173,16 @@ static bool llama_eval_cb_layer_chunk_offload(ggml_tensor * t, bool ask, void * 
                     (ggml_time_us() - t0) / 1000.0;
 
             t0 = ggml_time_us();
+
+            if (!d->lifecycle_log_emitted) {
+                fprintf(stderr,
+                        "LAYER_GROUP_LOAD_END group=%d range=%d:%d "
+                        "mechanism=madvise_willneed completion=advised\n",
+                        c,
+                        d->ranges[c].first,
+                        d->ranges[c].second);
+                d->lifecycle_log_emitted = true;
+            }
 
             for (int k = 1; k <= d->prefetch_depth; ++k) {
                 const int nc = c + k;
