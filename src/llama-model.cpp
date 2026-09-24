@@ -43,6 +43,21 @@
 #include <string>
 #include <vector>
 
+static bool llama_repack_single_slot_requested() {
+    const char * env = std::getenv("LLAMA_REPACK_SINGLE_SLOT");
+    return env != nullptr && std::strcmp(env, "1") == 0;
+}
+
+static bool llama_repack_single_slot_for_buft(ggml_backend_buffer_type_t buft) {
+    if (!llama_repack_single_slot_requested() || buft == nullptr) {
+        return false;
+    }
+    const char * name = ggml_backend_buft_name(buft);
+    return name != nullptr &&
+            std::strstr(name, "HTP") != nullptr &&
+            std::strstr(name, "REPACK") != nullptr;
+}
+
 static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params & params) {
     switch (arch) {
         case LLM_ARCH_LLAMA:
@@ -1653,7 +1668,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     };
 
     // Determine the largest logical REPACK chunk for each buffer type.
-    // Two physical buffers of this size are sufficient for alternating chunks.
+    // Default allocates two alternating buffers; opt-in HTP memory mode uses one.
     for (auto & [ctx_key, ctx_ptr] : ml.ctx_map) {
         if (!is_repack_residency_chunk(ctx_key)) {
             continue;
@@ -1674,9 +1689,11 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         }
     }
 
-    // Allocate exactly two physical REPACK residency slots per buffer type.
+    // Allocate two physical slots by default, or one HTP slot in memory mode.
     for (auto & group : pimpl->repack_slot_groups) {
-        for (int slot_id = 0; slot_id < 2; ++slot_id) {
+        const bool single_slot = llama_repack_single_slot_for_buft(group.buft);
+        const int slot_count = single_slot ? 1 : 2;
+        for (int slot_id = 0; slot_id < slot_count; ++slot_id) {
             ggml_backend_buffer_t raw =
                     ggml_backend_buft_alloc_buffer(group.buft, group.slot_size);
 
@@ -1692,9 +1709,12 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                     raw, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
 
             LLAMA_LOG_INFO(
-                    "REPACK_SLOT_ALLOC: buft=%s slot=%d requested_bytes=%zu actual_bytes=%zu\n",
+                    "REPACK_SLOT_ALLOC: buft=%s slot=%d mode=%s slot_count=%d "
+                    "requested_bytes=%zu actual_bytes=%zu\n",
                     ggml_backend_buft_name(group.buft),
                     slot_id,
+                    single_slot ? "single" : "dual",
+                    slot_count,
                     group.slot_size,
                     ggml_backend_buffer_get_size(raw));
 
@@ -1714,16 +1734,16 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         llama_buf_map buf_map;
         buf_map.reserve(n_max_backend_buffer);
 
-        // Layer REPACK chunks use two fixed physical buffers.
-        // Different logical chunks intentionally overlap in virtual tensor
-        // addresses within the same parity slot. Before a chunk executes,
-        // runtime residency code reloads its original GGUF weights into that slot.
+        // Layer REPACK chunks use fixed physical buffers. Different logical
+        // chunks overlap in virtual tensor addresses within the selected slot;
+        // runtime residency reloads each chunk before use.
         if (is_repack_residency_chunk(ctx_key)) {
             auto * group = find_repack_slot_group(buft);
             GGML_ASSERT(group != nullptr);
-            GGML_ASSERT(group->slots.size() == 2);
+            const bool single_slot = llama_repack_single_slot_for_buft(buft);
+            GGML_ASSERT(group->slots.size() == (single_slot ? 1u : 2u));
 
-            const int32_t slot_id = ctx_key.repack_chunk & 1;
+            const int32_t slot_id = single_slot ? 0 : (ctx_key.repack_chunk & 1);
             ggml_backend_buffer_t slot = group->slots.at(slot_id).get();
 
             const size_t alignment = ggml_backend_buffer_get_alignment(slot);
@@ -2541,7 +2561,23 @@ bool llama_model::supports_repack_chunk_residency() const {
     return ok;
 }
 
+bool llama_model::repack_single_slot_mode() const {
+    if (!llama_repack_single_slot_requested() ||
+            pimpl->repack_chunk_bindings.empty()) {
+        return false;
+    }
+    for (const auto & binding : pimpl->repack_chunk_bindings) {
+        if (!llama_repack_single_slot_for_buft(binding.buft)) {
+            return false;
+        }
+    }
+    return true;
+}
+
 bool llama_model::repack_async_backend_set_enabled() const {
+    if (repack_single_slot_mode()) {
+        return false;
+    }
     const bool supports = supports_repack_chunk_residency();
 
     static std::atomic<int> diag_count { 0 };
@@ -2621,6 +2657,12 @@ bool llama_model::repack_async_backend_set_enabled() const {
 }
 
 bool llama_model::repack_prefetch_chunk_async(int32_t chunk_id) const {
+    if (repack_single_slot_mode()) {
+        LLAMA_LOG_INFO(
+                "REPACK_ASYNC_PREFETCH_DISABLED: chunk=%d reason=single_slot_mode\n",
+                chunk_id);
+        return false;
+    }
     if (!supports_repack_chunk_residency()) {
         return false;
     }

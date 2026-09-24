@@ -204,8 +204,24 @@ static bool llama_eval_cb_layer_chunk_offload(ggml_tensor * t, bool ask, void * 
                 d->repack_residency ? ggml_time_us() : 0;
 
         if (d->repack_residency) {
+            const bool single_slot = d->model->repack_single_slot_mode();
+            if (single_slot) {
+                // The previous chunk has completed; load only this group.
+                if (!d->model->repack_load_chunk(c)) {
+                    d->repack_failed = true;
+                    LLAMA_LOG_ERROR(
+                            "REPACK_SINGLE_SLOT_LOAD_FAIL: finished_chunk=%d current_chunk=%d\n",
+                            c - 1,
+                            c);
+                    return false;
+                }
+                LLAMA_LOG_INFO(
+                        "REPACK_SINGLE_SLOT_ADVANCE: finished_chunk=%d current_chunk=%d slot=0 ahead=0\n",
+                        c - 1,
+                        c);
+            }
             const bool step2_async_set =
-                    d->model->repack_async_backend_set_enabled();
+                    !single_slot && d->model->repack_async_backend_set_enabled();
 
             if (step2_async_set) {
                 // Full async REPACK path: HTP_REPACK, or CPU_REPACK
@@ -261,7 +277,7 @@ static bool llama_eval_cb_layer_chunk_offload(ggml_tensor * t, bool ask, void * 
                         }
                     }
                 }
-            } else {
+            } else if (!single_slot) {
                 // Step 1 fallback.
                 // Synchronously materialize the next physical chunk, then
                 // pre-read the following chunk from GGUF/Flash into DRAM.
@@ -2470,6 +2486,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
             // each boundary, but explicitly synchronize all scheduler
             // backends here before replacing the slots at a new forward.
             ggml_backend_sched_synchronize(sched.get());
+            const bool single_slot = model.repack_single_slot_mode();
 
             if (!model.repack_load_chunk(0)) {
                 LLAMA_LOG_ERROR(
@@ -2478,7 +2495,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
                 return -3;
             }
 
-            if (repack_N > 1 && !model.repack_load_chunk(1)) {
+            if (!single_slot && repack_N > 1 && !model.repack_load_chunk(1)) {
                 LLAMA_LOG_ERROR(
                         "%s: failed to restore REPACK chunk 1\n",
                         __func__);
@@ -2493,7 +2510,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
             // Step 2 must NOT set/repack chunk2 yet: chunk0 is about to use
             // slot0.  Step-2 chunk2 is scheduled at the boundary entering
             // chunk1, after chunk0 has completed and slot0 is free.
-            if (repack_N > 2) {
+            if (!single_slot && repack_N > 2) {
                 if (model.repack_async_backend_set_enabled()) {
                     LLAMA_LOG_INFO(
                             "REPACK_ASYNC_STEP2_ARMED: "
@@ -2508,9 +2525,11 @@ int llama_context::decode(const llama_batch & batch_inp) {
             }
 
             LLAMA_LOG_INFO(
-                    "REPACK_FORWARD_READY: chunks=%d resident=[0,%d]\n",
+                    "REPACK_FORWARD_READY: chunks=%d mode=%s resident=[0,%d] ahead=%d\n",
                     repack_N,
-                    repack_N > 1 ? 1 : 0);
+                    single_slot ? "single_slot" : "dual_slot",
+                    single_slot ? 0 : (repack_N > 1 ? 1 : 0),
+                    single_slot ? 0 : 1);
         }
 
         // ---- Layer-chunk weight management ----

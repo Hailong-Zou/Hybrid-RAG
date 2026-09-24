@@ -669,6 +669,9 @@ struct llama_model {
     // Runtime residency for physically shared REPACK layer chunks.
     bool supports_repack_chunk_residency() const;
 
+    // Opt-in HTP memory mode: one physical REPACK slot, no ahead prefetch.
+    bool repack_single_slot_mode() const;
+
     // Full asynchronous REPACK residency path.
     // HTP_REPACK always uses it; CPU_REPACK uses it when
     // LLAMA_REPACK_ASYNC_CPU=1. The released parity slot may then be
