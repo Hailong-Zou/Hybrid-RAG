@@ -18,6 +18,8 @@
 #include "speculative.h"
 #include "mtmd.h"
 #include "mtmd-helper.h"
+#include "../../src/llama-ext.h"
+#include "ggml-backend.h"
 
 #include <algorithm>
 #include <cstddef>
@@ -29,6 +31,9 @@
 #include <utility>
 #include <fstream>
 #include <unordered_map>
+#include <chrono>
+#include <set>
+#include <cstring>
 
 // fix problem with std::min and std::max
 #if defined(_WIN32)
@@ -1011,7 +1016,89 @@ private:
         return false;
     }
 
+    void log_memory_account(const char * event, int slot_id = -1,
+                            std::uint64_t handle = 0) const {
+        const char * enabled = std::getenv("LLAMA_MEM_ACCOUNT");
+        if (enabled == nullptr || std::strcmp(enabled, "1") != 0) {
+            return;
+        }
+
+        std::size_t weights_bytes = 0;
+        std::size_t weights_mmap_logical_bytes = 0;
+        std::size_t kv_bytes = 0;
+        std::size_t runtime_bytes = 0;
+        std::size_t handoff_capacity_bytes = 0;
+        std::size_t handoff_count = 0;
+        std::set<const llama_context *> seen_contexts;
+        std::set<const llama_model *> seen_models;
+
+        const auto account_context = [&](const llama_context * ctx,
+                                         bool host_mmap) {
+            if (ctx == nullptr || !seen_contexts.insert(ctx).second) {
+                return;
+            }
+            const llama_model * model = llama_get_model(ctx);
+            const bool count_model = model != nullptr &&
+                                     seen_models.insert(model).second;
+            for (const auto & [buft, data] : llama_get_memory_breakdown(ctx)) {
+                const char * name = ggml_backend_buft_name(buft);
+                const bool mapped_host = host_mmap && name != nullptr &&
+                                         std::strstr(name, "CPU") != nullptr;
+                if (count_model) {
+                    if (mapped_host) {
+                        weights_mmap_logical_bytes += data.model;
+                    } else {
+                        weights_bytes += data.model;
+                    }
+                }
+                kv_bytes += data.context;
+                runtime_bytes += data.compute;
+            }
+        };
+
+        account_context(ctx_tgt, params_base.use_mmap);
+        account_context(ctx_dft, params_base.use_mmap);
+        for (const auto & slot : slots) {
+            if (slot.generation_decode_executor) {
+                account_context(slot.generation_decode_executor->context(), true);
+            }
+        }
+
+        const auto account_handoff = [&](const server_generation_handoff * h) {
+            if (h == nullptr) {
+                return;
+            }
+            handoff_count++;
+            handoff_capacity_bytes += h->sequence_state.capacity();
+            handoff_capacity_bytes += h->final_logits.capacity() * sizeof(float);
+            handoff_capacity_bytes += h->prompt_tokens.capacity() * sizeof(llama_token);
+        };
+        for (const auto & [_, h] : generation_handoffs) {
+            account_handoff(h.get());
+        }
+        for (const auto & slot : slots) {
+            account_handoff(slot.generation_handoff.get());
+        }
+
+        const auto now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::system_clock::now().time_since_epoch()).count();
+        const std::size_t known_total = weights_bytes + kv_bytes +
+                                        runtime_bytes + handoff_capacity_bytes;
+        std::fprintf(stderr,
+                "MEM_ACCOUNT ts_epoch_ns=%lld scope=model model=%s event=%s "
+                "slot=%d handle=%" PRIu64 " weights_bytes=%zu "
+                "weights_mmap_logical_bytes=%zu kv_bytes=%zu "
+                "runtime_bytes=%zu intermediate_bytes=%zu "
+                "intermediate_scope=handoff_only known_total_bytes=%zu "
+                "contexts=%zu handoffs=%zu layer_group=unavailable\n",
+                static_cast<long long>(now_ns), model_name.c_str(), event,
+                slot_id, handle, weights_bytes, weights_mmap_logical_bytes,
+                kv_bytes, runtime_bytes, handoff_capacity_bytes, known_total,
+                seen_contexts.size(), handoff_count);
+    }
+
     void destroy() {
+        log_memory_account("MODEL_UNLOAD_BEGIN");
         // Decode executors contain Contexts that reference the dedicated
         // CPU Decode model. Destroy every executor before releasing that
         // model.
@@ -1693,6 +1780,7 @@ private:
             }
         }
 
+        log_memory_account("MODEL_READY");
         return true;
     }
 
@@ -2544,6 +2632,8 @@ private:
             }
 
             slot.state = SLOT_STATE_GENERATING;
+            log_memory_account("GEN_DECODE_BEGIN", slot.id,
+                    generation_handoff_handle);
 
             SLT_INF(
                     slot,
@@ -2866,6 +2956,9 @@ private:
             slot.print_timings();
             send_final_response(slot);
             metrics.on_prediction(slot);
+            if (slot.generation_decode_executor) {
+                log_memory_account("GEN_DECODE_END", slot.id);
+            }
             slot.release();
             return false;
         }
@@ -4719,6 +4812,7 @@ private:
             // any generated token.
             if (slot.n_decoded == 0 &&
                     slot.task->params.generation_handoff) {
+                log_memory_account("GEN_PREFILL_END_BEFORE_EXPORT", slot.id);
                 if (slot.can_speculate()) {
                     throw std::runtime_error(
                             "generation handoff is not compatible with "
@@ -4936,6 +5030,7 @@ private:
                             logits_count,
                             producer_backend.c_str());
 
+                    log_memory_account("GEN_PREFILL_END", slot.id, handle);
                     send_final_response(
                             slot,
                             true,

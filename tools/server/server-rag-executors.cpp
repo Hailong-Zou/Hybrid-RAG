@@ -3,8 +3,31 @@
 
 #include <algorithm>
 #include <cinttypes>
+#include <chrono>
+#include <cstdlib>
+#include <cstring>
 #include <numeric>
 #include <stdexcept>
+
+static void rag_memory_marker(const char * event, const char * stage,
+                              std::uint64_t request_id, int task_id,
+                              std::size_t candidate_index) {
+    const char * enabled = std::getenv("LLAMA_MEM_ACCOUNT");
+    if (enabled == nullptr || std::strcmp(enabled, "1") != 0) {
+        return;
+    }
+    const auto now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count();
+    const long long candidate = candidate_index == RAG_INVALID_INDEX
+            ? -1 : static_cast<long long>(candidate_index);
+    SRV_INF("MEM_ACCOUNT ts_epoch_ns=%lld scope=rag event=%s "
+            "request=%" PRIu64 " task=%d stage=%s candidate=%lld "
+            "weights_bytes=unavailable kv_bytes=unavailable "
+            "runtime_bytes=unavailable intermediate_bytes=unavailable "
+            "known_total_bytes=unavailable\n",
+            static_cast<long long>(now_ns), event, request_id, task_id,
+            stage, candidate);
+}
 
 RagServerExecutor::RagServerExecutor(server_models * models, RagTaskType type)
     : models_(models), type_(type) {}
@@ -35,6 +58,12 @@ RagTaskResult RagServerExecutor::execute(const RagTaskContext & ctx) {
         return result;
     }
 
+    if (type_ == RagTaskType::DocumentEmbedding) {
+        rag_memory_marker("REQUEST_BEGIN", "request", runtime->request_id,
+                          ctx.task_id, RAG_INVALID_INDEX);
+    }
+    rag_memory_marker("STAGE_BEGIN", stage_name(type_), runtime->request_id,
+                      ctx.task_id, ctx.candidate_index);
     SRV_INF(
             "RAG_STAGE_BEGIN request=%" PRIu64 " task=%d stage=%s "
             "query_index=%zu candidate_index=%zu\n",
@@ -1006,6 +1035,12 @@ RagTaskResult RagServerExecutor::execute(const RagTaskContext & ctx) {
         result.error_message = e.what();
     }
 
+    rag_memory_marker("STAGE_END", stage_name(type_), runtime->request_id,
+                      ctx.task_id, ctx.candidate_index);
+    if (type_ == RagTaskType::Finalize) {
+        rag_memory_marker("REQUEST_END", "request", runtime->request_id,
+                          ctx.task_id, RAG_INVALID_INDEX);
+    }
     SRV_INF(
             "RAG_STAGE_END request=%" PRIu64 " task=%d stage=%s "
             "status=%s\n",
