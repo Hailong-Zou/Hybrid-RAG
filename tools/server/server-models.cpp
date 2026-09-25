@@ -44,6 +44,12 @@ extern char **environ;
 
 #define DEFAULT_STOP_TIMEOUT 10 // seconds
 
+static int64_t server_models_steady_time_ms() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch())
+            .count();
+}
+
 #define CMD_ROUTER_TO_CHILD_EXIT  "cmd_router_to_child:exit"
 #define CMD_CHILD_TO_ROUTER_STATE "cmd_child_to_router:state:" // followed by json string
 
@@ -714,6 +720,27 @@ std::optional<server_model_meta> server_models::get_meta(const std::string & nam
     return std::nullopt;
 }
 
+std::optional<server_models::model_load_timing_snapshot>
+server_models::get_model_load_timing_snapshot(const std::string & name) {
+    const auto meta = get_meta(name);
+    if (!meta.has_value()) {
+        return std::nullopt;
+    }
+    std::lock_guard<std::mutex> lock(mutex);
+    const auto it = mapping.find(meta->name);
+    if (it == mapping.end()) {
+        return std::nullopt;
+    }
+    const auto & instance = it->second;
+    return model_load_timing_snapshot{
+            instance.meta.status,
+            instance.load_generation,
+            instance.last_load_started_at_ms,
+            instance.last_load_duration_ms,
+            instance.last_ready_at_ms,
+    };
+}
+
 // helper to convert vector<string> to char **
 // pointers are only valid as long as the original vector is valid
 static std::vector<char *> to_char_ptr_array(const std::vector<std::string> & vec) {
@@ -813,6 +840,7 @@ void server_models::load(const std::string & name, const load_options & opts) {
             throw std::runtime_error("model limit reached, try again later");
         }
     }
+    const int64_t load_started_at_ms = server_models_steady_time_ms();
     SRV_INF(
             "MODEL_LOAD_BEGIN model=%s weight_bytes=unavailable "
             "backend_buffer_bytes=unavailable kv_bytes=unavailable "
@@ -827,6 +855,13 @@ void server_models::load(const std::string & name, const load_options & opts) {
     inst.meta.status      = SERVER_MODEL_STATUS_LOADING;
     inst.meta.loaded_info = json{};
     inst.meta.last_used   = ggml_time_ms();
+    inst.load_started_at_ms = load_started_at_ms;
+    inst.last_load_started_at_ms = load_started_at_ms;
+    if (const auto previous = mapping.find(meta.name); previous != mapping.end()) {
+        inst.load_generation = previous->second.load_generation;
+        inst.last_load_duration_ms = previous->second.last_load_duration_ms;
+        inst.last_ready_at_ms = previous->second.last_ready_at_ms;
+    }
 
     if (inst.meta.port <= 0) {
         throw std::runtime_error("failed to get a port number");
@@ -1087,7 +1122,20 @@ void server_models::update_status(const std::string & name, const update_status_
     std::unique_lock<std::mutex> lk(mutex);
     auto it = mapping.find(name);
     if (it != mapping.end()) {
-        auto & meta = it->second.meta;
+        auto & instance = it->second;
+        auto & meta = instance.meta;
+        const auto previous_status = meta.status;
+        if (args.status == SERVER_MODEL_STATUS_LOADED) {
+            const int64_t ready_at_ms = server_models_steady_time_ms();
+            instance.last_ready_at_ms = ready_at_ms;
+            if (previous_status == SERVER_MODEL_STATUS_LOADING &&
+                instance.load_started_at_ms > 0) {
+                instance.last_load_duration_ms =
+                        std::max<int64_t>(0, ready_at_ms - instance.load_started_at_ms);
+                instance.load_generation++;
+                instance.load_started_at_ms = 0;
+            }
+        }
         meta.status      = args.status;
         meta.exit_code   = args.exit_code;
         if (!args.loaded_info.is_null()) {
@@ -1647,12 +1695,16 @@ void server_models::handle_child_state(const std::string & name, const std::stri
                 });
                 if (before.has_value() &&
                     before->status == SERVER_MODEL_STATUS_LOADING) {
+                    const auto timing = get_model_load_timing_snapshot(name);
                     SRV_INF(
                             "MODEL_LOAD_END model=%s status=loaded "
+                            "duration_ms=%lld load_generation=%llu "
                             "weight_bytes=unavailable "
                             "backend_buffer_bytes=unavailable "
                             "kv_bytes=unavailable runtime_bytes=unavailable\n",
-                            before->name.c_str());
+                            before->name.c_str(),
+                            static_cast<long long>(timing.has_value() ? timing->last_load_duration_ms : 0),
+                            static_cast<unsigned long long>(timing.has_value() ? timing->load_generation : 0));
                 }
             } break;
         case SERVER_STATE_SLEEPING:
@@ -2890,6 +2942,44 @@ void server_models_routes::init_routes() {
                     task_wall_span_ms(
                             RagTaskType::GenerationPrefill,
                             RagTaskType::GenerationPrefill);
+            runtime->generation_sub_metrics.prefill_stage_ms =
+                    runtime->generation_sub_metrics.prefill_ms;
+
+            int64_t latest_prefill_end_ms = 0;
+            std::size_t completed_prefill_candidates = 0;
+            for (const auto & entry : phase_b.metrics) {
+                const auto & metric = entry.second;
+                if (metric.task_type != RagTaskType::GenerationPrefill ||
+                    metric.final_state != RagTaskState::Completed ||
+                    metric.end_ms < metric.start_ms) {
+                    continue;
+                }
+                latest_prefill_end_ms = std::max(latest_prefill_end_ms, metric.end_ms);
+                completed_prefill_candidates++;
+            }
+
+            const int64_t hot_start_ms =
+                    runtime->generation_prefill_hot_start_ms.load(std::memory_order_relaxed);
+            runtime->generation_sub_metrics.prefill_hot_ms =
+                    hot_start_ms < latest_prefill_end_ms
+                            ? static_cast<std::size_t>(latest_prefill_end_ms - hot_start_ms)
+                            : 0;
+            runtime->generation_sub_metrics.model_load_ms =
+                    runtime->generation_model_load_ms.load(std::memory_order_relaxed);
+            runtime->generation_sub_metrics.model_load_triggered =
+                    runtime->generation_model_load_triggered.load(std::memory_order_relaxed);
+            SRV_INF(
+                    "GEN_PREFILL_STAGE_SUMMARY request=%llu stage_ms=%zu "
+                    "model_load_ms=%zu model_load_triggered=%s hot_ms=%zu "
+                    "candidate_count=%zu completed_candidates=%zu "
+                    "span=earliest_start_to_latest_handoff\n",
+                    static_cast<unsigned long long>(runtime->request_id),
+                    runtime->generation_sub_metrics.prefill_stage_ms,
+                    runtime->generation_sub_metrics.model_load_ms,
+                    runtime->generation_sub_metrics.model_load_triggered ? "true" : "false",
+                    runtime->generation_sub_metrics.prefill_hot_ms,
+                    runtime->generation_candidates.size(),
+                    completed_prefill_candidates);
 
             runtime->generation_sub_metrics.decode_ms =
                     task_wall_span_ms(
@@ -3053,6 +3143,30 @@ void server_models_routes::init_routes() {
                                     runtime
                                             ->generation_sub_metrics
                                             .prefill_ms,
+                                },
+                                {
+                                    "generation_prefill_stage_ms",
+                                    runtime
+                                            ->generation_sub_metrics
+                                            .prefill_stage_ms,
+                                },
+                                {
+                                    "generation_model_load_ms",
+                                    runtime
+                                            ->generation_sub_metrics
+                                            .model_load_ms,
+                                },
+                                {
+                                    "generation_model_load_triggered",
+                                    runtime
+                                            ->generation_sub_metrics
+                                            .model_load_triggered,
+                                },
+                                {
+                                    "generation_prefill_hot_ms",
+                                    runtime
+                                            ->generation_sub_metrics
+                                            .prefill_hot_ms,
                                 },
                                 {
                                     "generation_decode_ms",

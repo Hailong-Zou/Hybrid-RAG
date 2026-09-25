@@ -113,6 +113,11 @@ private:
         std::shared_ptr<server_subproc> subproc; // shared between main thread and monitoring thread
         std::thread th;
         server_model_meta meta;
+        int64_t load_started_at_ms = 0;
+        int64_t last_load_started_at_ms = 0;
+        int64_t last_load_duration_ms = 0;
+        int64_t last_ready_at_ms = 0;
+        std::uint64_t load_generation = 0;
     };
 
     std::mutex mutex;
@@ -205,6 +210,16 @@ public:
 
     // return a copy of model metadata (thread-safe)
     std::optional<server_model_meta> get_meta(const std::string & name);
+
+    struct model_load_timing_snapshot {
+        server_model_status status = SERVER_MODEL_STATUS_UNLOADED;
+        std::uint64_t load_generation = 0;
+        int64_t last_load_started_at_ms = 0;
+        int64_t last_load_duration_ms = 0;
+        int64_t last_ready_at_ms = 0;
+    };
+
+    std::optional<model_load_timing_snapshot> get_model_load_timing_snapshot(const std::string & name);
 
     // return a copy of all model metadata (thread-safe)
     std::vector<server_model_meta> get_all_meta();

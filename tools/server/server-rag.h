@@ -46,7 +46,13 @@ struct RagGenerationCandidate {
 };
 
 struct RagGenerationSubMetrics {
+    // Compatibility metric: GenerationPrefill scheduler-stage wall span,
+    // not NPU-only prompt processing.
     std::size_t prefill_ms = 0;
+    std::size_t prefill_stage_ms = 0;
+    std::size_t model_load_ms = 0;
+    std::size_t prefill_hot_ms = 0;
+    bool model_load_triggered = false;
     std::size_t export_ms = 0;
     std::size_t restore_ms = 0;
     std::size_t decode_ms = 0;
@@ -126,6 +132,11 @@ struct RagRequestRuntime {
     std::vector<RagGenerationCandidate> generation_candidates;
     std::size_t selected_generation_candidate_index =
             RAG_INVALID_INDEX;
+    std::atomic<std::uint64_t> generation_load_generation_observed { 0 };
+    std::atomic<std::size_t> generation_model_load_ms { 0 };
+    std::atomic<bool> generation_model_load_triggered { false };
+    std::atomic<std::int64_t> generation_prefill_hot_start_ms {
+            std::numeric_limits<std::int64_t>::max() };
 
     std::string final_answer;
     RagStageMetrics stage_metrics;

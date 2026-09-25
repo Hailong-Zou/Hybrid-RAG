@@ -9,6 +9,21 @@
 #include <numeric>
 #include <stdexcept>
 
+static int64_t rag_steady_time_ms() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch())
+            .count();
+}
+
+static void rag_atomic_min(std::atomic<std::int64_t> & target, std::int64_t value) {
+    auto current = target.load(std::memory_order_relaxed);
+    while (value < current &&
+           !target.compare_exchange_weak(
+                   current, value, std::memory_order_relaxed,
+                   std::memory_order_relaxed)) {
+    }
+}
+
 static void rag_memory_marker(const char * event, const char * stage,
                               std::uint64_t request_id, int task_id,
                               std::size_t candidate_index) {
@@ -371,6 +386,20 @@ RagTaskResult RagServerExecutor::execute(const RagTaskContext & ctx) {
                         "candidate index");
             }
 
+            const int64_t prefill_task_start_ms = rag_steady_time_ms();
+            const auto load_timing_before =
+                    models_->get_model_load_timing_snapshot(req.generation_model);
+            const std::uint64_t load_generation_before =
+                    load_timing_before.has_value()
+                            ? load_timing_before->load_generation
+                            : 0;
+            if (load_timing_before.has_value() &&
+                (load_timing_before->status == SERVER_MODEL_STATUS_LOADED ||
+                 load_timing_before->status == SERVER_MODEL_STATUS_SLEEPING)) {
+                rag_atomic_min(runtime->generation_prefill_hot_start_ms,
+                               prefill_task_start_ms);
+            }
+
             auto & candidate =
                     runtime->generation_candidates.at(
                             ctx.candidate_index);
@@ -583,6 +612,40 @@ RagTaskResult RagServerExecutor::execute(const RagTaskContext & ctx) {
                 candidate.error = error.what();
                 candidate.prefill_success = false;
                 candidate.success = false;
+            }
+
+            const auto load_timing_after =
+                    models_->get_model_load_timing_snapshot(req.generation_model);
+            if (load_timing_after.has_value()) {
+                const bool cold_load_completed_during_task =
+                        load_timing_after->load_generation > load_generation_before &&
+                        load_timing_after->last_load_started_at_ms >= prefill_task_start_ms &&
+                        load_timing_after->last_ready_at_ms >= prefill_task_start_ms;
+                if (cold_load_completed_during_task) {
+                    rag_atomic_min(runtime->generation_prefill_hot_start_ms,
+                                   load_timing_after->last_ready_at_ms);
+                    std::uint64_t expected_generation = 0;
+                    if (runtime->generation_load_generation_observed
+                                .compare_exchange_strong(
+                                        expected_generation,
+                                        load_timing_after->load_generation,
+                                        std::memory_order_relaxed,
+                                        std::memory_order_relaxed)) {
+                        runtime->generation_model_load_ms.store(
+                                static_cast<std::size_t>(
+                                        std::max<int64_t>(
+                                                0,
+                                                load_timing_after->last_load_duration_ms)),
+                                std::memory_order_relaxed);
+                        runtime->generation_model_load_triggered.store(
+                                true, std::memory_order_relaxed);
+                    }
+                } else if (load_timing_before.has_value() &&
+                           (load_timing_before->status == SERVER_MODEL_STATUS_LOADED ||
+                            load_timing_before->status == SERVER_MODEL_STATUS_SLEEPING)) {
+                    rag_atomic_min(runtime->generation_prefill_hot_start_ms,
+                                   prefill_task_start_ms);
+                }
             }
         } else if (
                 type_ == RagTaskType::GenerationDecode) {
