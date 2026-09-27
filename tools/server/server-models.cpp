@@ -2438,6 +2438,13 @@ void server_models_routes::init_routes() {
             runtime->generation_candidates.resize(
                     generation_candidate_count);
 
+            // Fixed-size, profiling-only counters for concurrent branches.
+            runtime->profile_branch_query_bytes.assign(runtime->query_branches.size(), 0);
+            runtime->profile_branch_embedding_bytes.assign(runtime->query_branches.size(), 0);
+            runtime->profile_branch_retrieval_bytes.assign(runtime->query_branches.size(), 0);
+            runtime->profile_candidate_prompt_bytes.assign(generation_candidate_count, 0);
+            runtime->profile_candidate_state_bytes.assign(generation_candidate_count, 0);
+
             runtime->selected_generation_candidate_index =
                     RAG_INVALID_INDEX;
 

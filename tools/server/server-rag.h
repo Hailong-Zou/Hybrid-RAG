@@ -130,6 +130,14 @@ struct RagRequestRuntime {
 
     // Scheduler-visible per-candidate generation state.
     std::vector<RagGenerationCandidate> generation_candidates;
+    // Profiling-only capacity snapshots. Concurrent branches update their own
+    // entry under mutex; observers never inspect a branch while it is mutated.
+    // These arrays do not participate in scheduling or inference.
+    std::vector<std::size_t> profile_branch_query_bytes;
+    std::vector<std::size_t> profile_branch_embedding_bytes;
+    std::vector<std::size_t> profile_branch_retrieval_bytes;
+    std::vector<std::size_t> profile_candidate_prompt_bytes;
+    std::vector<std::size_t> profile_candidate_state_bytes;
     std::size_t selected_generation_candidate_index =
             RAG_INVALID_INDEX;
     std::atomic<std::uint64_t> generation_load_generation_observed { 0 };

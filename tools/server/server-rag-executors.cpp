@@ -44,6 +44,102 @@ static void rag_memory_marker(const char * event, const char * stage,
             stage, candidate);
 }
 
+// Count dynamically reserved storage, not just container headers. An SSO
+// string's data lives inside its owning object, which is already covered by
+// the containing vector capacity (or is stack/object storage).
+static std::size_t rag_heap_string_bytes(const std::string & s) {
+    const auto p = reinterpret_cast<std::uintptr_t>(s.data());
+    const auto lo = reinterpret_cast<std::uintptr_t>(&s);
+    if (p >= lo && p < lo + sizeof(s)) {
+        return 0;
+    }
+    return s.capacity() + 1;
+}
+
+static std::size_t rag_string_vector_bytes(const std::vector<std::string> & v) {
+    std::size_t bytes = v.capacity() * sizeof(std::string);
+    for (const auto & s : v) bytes += rag_heap_string_bytes(s);
+    return bytes;
+}
+
+template <typename T>
+static std::size_t rag_nested_vector_bytes(const std::vector<std::vector<T>> & v) {
+    std::size_t bytes = v.capacity() * sizeof(std::vector<T>);
+    for (const auto & x : v) bytes += x.capacity() * sizeof(T);
+    return bytes;
+}
+
+static bool rag_mem_profile_enabled() {
+    const char * e = std::getenv("LLAMA_MEM_ACCOUNT");
+    return e != nullptr && std::strcmp(e, "1") == 0;
+}
+
+static void rag_profile_branch(RagRequestRuntime & r, std::size_t index) {
+    if (!rag_mem_profile_enabled() || index >= r.query_branches.size()) return;
+    const auto & b = r.query_branches[index];
+    std::lock_guard<std::mutex> lock(r.mutex);
+    r.profile_branch_query_bytes[index] = rag_heap_string_bytes(b.query);
+    r.profile_branch_embedding_bytes[index] = b.embedding.capacity() * sizeof(float);
+    r.profile_branch_retrieval_bytes[index] = b.retrieval_indices.capacity() * sizeof(std::size_t);
+}
+
+static void rag_profile_candidate(RagRequestRuntime & r, std::size_t index) {
+    if (!rag_mem_profile_enabled() || index >= r.generation_candidates.size()) return;
+    const auto & c = r.generation_candidates[index];
+    std::lock_guard<std::mutex> lock(r.mutex);
+    r.profile_candidate_prompt_bytes[index] = rag_heap_string_bytes(c.prompt);
+    r.profile_candidate_state_bytes[index] =
+            rag_heap_string_bytes(c.content) + rag_heap_string_bytes(c.stop_reason) +
+            rag_heap_string_bytes(c.error) + rag_heap_string_bytes(c.generation_handoff_producer_backend);
+}
+
+static void rag_intermediate_snapshot(RagRequestRuntime & r,
+                                      const char * stage, const char * point,
+                                      int task_id, std::size_t candidate_index,
+                                      std::size_t local_rerank_bytes = 0) {
+    if (!rag_mem_profile_enabled()) return;
+    std::size_t query_bytes = rag_heap_string_bytes(r.request.doc) +
+                              rag_heap_string_bytes(r.request.query) +
+                              rag_string_vector_bytes(r.chunks) +
+                              rag_string_vector_bytes(r.expanded_queries) +
+                              r.query_branches.capacity() * sizeof(RagQueryBranchResult);
+    std::size_t embedding_bytes = rag_nested_vector_bytes(r.document_embeddings) +
+                                  rag_nested_vector_bytes(r.query_embeddings);
+    std::size_t retrieval_bytes = rag_nested_vector_bytes(r.retrieval_results) +
+                                  r.retrieved_indices.capacity() * sizeof(std::size_t);
+    std::size_t prompt_bytes = r.generation_candidates.capacity() * sizeof(RagGenerationCandidate) +
+                               rag_heap_string_bytes(r.generation_prompt);
+    std::size_t state_bytes = rag_heap_string_bytes(r.generation_result) +
+                              rag_heap_string_bytes(r.final_answer);
+    {
+        std::lock_guard<std::mutex> lock(r.mutex);
+        for (auto x : r.profile_branch_query_bytes) query_bytes += x;
+        for (auto x : r.profile_branch_embedding_bytes) embedding_bytes += x;
+        for (auto x : r.profile_branch_retrieval_bytes) retrieval_bytes += x;
+        for (auto x : r.profile_candidate_prompt_bytes) prompt_bytes += x;
+        for (auto x : r.profile_candidate_state_bytes) state_bytes += x;
+    }
+    const std::size_t rerank_bytes = rag_string_vector_bytes(r.reranked_chunks) + local_rerank_bytes;
+    // Handoff capacity is owned and logged by the model child. Do not count
+    // the router's handle metadata as a second copy of its state buffer.
+    const std::size_t total = query_bytes + embedding_bytes + retrieval_bytes +
+                              rerank_bytes + prompt_bytes + state_bytes;
+    const auto now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count();
+    const long long candidate = candidate_index == RAG_INVALID_INDEX
+            ? -1 : static_cast<long long>(candidate_index);
+    SRV_INF("RAG_MEM_SNAPSHOT ts_epoch_ns=%lld request=%" PRIu64
+            " stage=%s point=%s task=%d candidate=%lld "
+            "intermediate_query_bytes=%zu intermediate_embedding_bytes=%zu "
+            "intermediate_retrieval_bytes=%zu intermediate_rerank_bytes=%zu "
+            "intermediate_prompt_bytes=%zu intermediate_handoff_bytes=child_accounted "
+            "intermediate_generation_state_bytes=%zu intermediate_router_total_bytes=%zu "
+            "tree_state_bytes=unavailable scope=reserved_capacity\n",
+            static_cast<long long>(now_ns), r.request_id, stage, point, task_id,
+            candidate, query_bytes, embedding_bytes, retrieval_bytes,
+            rerank_bytes, prompt_bytes, state_bytes, total);
+}
+
 RagServerExecutor::RagServerExecutor(server_models * models, RagTaskType type)
     : models_(models), type_(type) {}
 
@@ -79,6 +175,8 @@ RagTaskResult RagServerExecutor::execute(const RagTaskContext & ctx) {
     }
     rag_memory_marker("STAGE_BEGIN", stage_name(type_), runtime->request_id,
                       ctx.task_id, ctx.candidate_index);
+    rag_intermediate_snapshot(*runtime, stage_name(type_), "BEGIN",
+                              ctx.task_id, ctx.candidate_index);
     SRV_INF(
             "RAG_STAGE_BEGIN request=%" PRIu64 " task=%d stage=%s "
             "query_index=%zu candidate_index=%zu\n",
@@ -117,6 +215,8 @@ RagTaskResult RagServerExecutor::execute(const RagTaskContext & ctx) {
 
                 runtime->document_embeddings.push_back(
                         std::move(embeddings.front()));
+                rag_intermediate_snapshot(*runtime, "document_embedding", "AFTER_CHUNK",
+                                          ctx.task_id, ctx.candidate_index);
             }
 
             if (req.stage_model_residency) {
@@ -268,8 +368,10 @@ RagTaskResult RagServerExecutor::execute(const RagTaskContext & ctx) {
 
             branch.query_index = ctx.query_index;
             branch.query = query;
+            rag_profile_branch(*runtime, ctx.query_index);
             branch.embedding =
                     std::move(embeddings.front());
+            rag_profile_branch(*runtime, ctx.query_index);
             branch.error.clear();
             branch.success = false;
         } else if (type_ == RagTaskType::VectorSearch) {
@@ -304,6 +406,7 @@ RagTaskResult RagServerExecutor::execute(const RagTaskContext & ctx) {
                             indices,
                             branch.embedding,
                             req.top_k);
+            rag_profile_branch(*runtime, ctx.query_index);
 
             branch.success = true;
             branch.error.clear();
@@ -351,6 +454,9 @@ RagTaskResult RagServerExecutor::execute(const RagTaskContext & ctx) {
         }
 
         runtime->reranked_chunks = candidates;
+        rag_intermediate_snapshot(*runtime, "reranking", "CANDIDATES_READY",
+                                  ctx.task_id, ctx.candidate_index,
+                                  rag_string_vector_bytes(candidates));
 
         if (!req.rerank_model.empty()) {
             const json ranked =
@@ -452,6 +558,9 @@ RagTaskResult RagServerExecutor::execute(const RagTaskContext & ctx) {
                  generation_segments) {
                 candidate.prompt += segment;
             }
+            rag_profile_candidate(*runtime, ctx.candidate_index);
+            rag_intermediate_snapshot(*runtime, "generation_prefill", "PROMPT_READY",
+                                      ctx.task_id, ctx.candidate_index);
 
             candidate.content.clear();
             candidate.stop_reason.clear();
@@ -1098,6 +1207,12 @@ RagTaskResult RagServerExecutor::execute(const RagTaskContext & ctx) {
         result.error_message = e.what();
     }
 
+    if (ctx.candidate_index != RAG_INVALID_INDEX &&
+        ctx.candidate_index < runtime->generation_candidates.size()) {
+        rag_profile_candidate(*runtime, ctx.candidate_index);
+    }
+    rag_intermediate_snapshot(*runtime, stage_name(type_), "END",
+                              ctx.task_id, ctx.candidate_index);
     rag_memory_marker("STAGE_END", stage_name(type_), runtime->request_id,
                       ctx.task_id, ctx.candidate_index);
     if (type_ == RagTaskType::Finalize) {
