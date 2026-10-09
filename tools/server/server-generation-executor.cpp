@@ -1,6 +1,12 @@
 #include "server-generation-executor.h"
 
 #include "llama-conflayer.h"
+#include "../../src/llama-ext.h"
+#include "ggml-backend.h"
+#if defined(__linux__)
+#include <sys/mman.h>
+#include <unistd.h>
+#endif
 
 #include <algorithm>
 #include <array>
@@ -13,6 +19,40 @@
 #include <vector>
 
 namespace {
+
+// Only use after every KV byte is zero and all old sequences are discarded.
+static void reclaim_zero_cpu_kv(llama_context * ctx) {
+#if defined(__linux__)
+    const long page_size_long = sysconf(_SC_PAGESIZE);
+    if (page_size_long <= 0) return;
+    struct stats {
+        uintptr_t page_size;
+        size_t bytes = 0;
+        size_t failures = 0;
+    } result{static_cast<uintptr_t>(page_size_long)};
+    llama_context_visit_memory_regions(ctx,
+            [](void * userdata, const void * base, size_t size,
+                    llama_memory_region_kind kind, ggml_backend_buffer_type_t buft) {
+                auto & s = *static_cast<stats *>(userdata);
+                if (kind != LLAMA_MEMORY_REGION_KV || base == nullptr || buft == nullptr ||
+                        !ggml_backend_buft_is_host(buft) ||
+                        std::strcmp(ggml_backend_buft_name(buft), "CPU") != 0) return;
+                const uintptr_t first = reinterpret_cast<uintptr_t>(base);
+                if (size > std::numeric_limits<uintptr_t>::max() - first ||
+                        first > std::numeric_limits<uintptr_t>::max() - (s.page_size - 1)) return;
+                const uintptr_t begin = (first + s.page_size - 1) & ~(s.page_size - 1);
+                const uintptr_t end = (first + size) & ~(s.page_size - 1);
+                if (end <= begin) return;
+                if (madvise(reinterpret_cast<void *>(begin), end - begin, MADV_DONTNEED) == 0)
+                    s.bytes += end - begin;
+                else ++s.failures;
+            }, &result);
+    std::fprintf(stderr, "DECODE_ZERO_KV_RECLAIM context=%p advised_bytes=%zu failures=%zu\n",
+            static_cast<void *>(ctx), result.bytes, result.failures);
+#else
+    (void) ctx;
+#endif
+}
 
 struct generation_batch_guard {
     llama_batch batch;
@@ -448,7 +488,8 @@ server_generation_decode_executor(
         llama_seq_id sequence_id,
         bool conflayer_enabled,
         int32_t conflayer_max_skip_layers,
-        bool conflayer_ngram_spec_enabled)
+        bool conflayer_ngram_spec_enabled,
+        bool reclaim_zero_kv_control)
     : model_(model),
       sequence_id_(sequence_id) {
     if (model_ == nullptr) {
@@ -608,6 +649,12 @@ server_generation_decode_executor(
                 "failed to create CPU Decode Context");
     }
 
+    const char * parallel = std::getenv("LLAMA_RAG_PARALLEL_DECODE");
+    reclaim_zero_kv_ = !reclaim_zero_kv_control && !context_params.cluster_attn && parallel != nullptr &&
+            std::strcmp(parallel, "1") == 0;
+    // Context construction has already cleared its KV buffers to zero.
+    if (reclaim_zero_kv_) reclaim_zero_cpu_kv(ctx_.get());
+
     if (nseq_diag_max != nullptr ||
             nseq_diag_unified != nullptr) {
         fprintf(stderr,
@@ -718,6 +765,12 @@ llama_token server_generation_decode_executor::begin(
         const server_generation_handoff & handoff) {
     reset();
 
+    if (reclaim_zero_kv_) {
+        // Preserve zero padding before restoring this request's live cells.
+        llama_memory_clear(llama_get_memory(ctx_.get()), true);
+        reclaim_zero_cpu_kv(ctx_.get());
+    }
+
     try {
         server_generation_handoff_restore(
                 ctx_.get(),
@@ -728,6 +781,14 @@ llama_token server_generation_decode_executor::begin(
                 "HANDOFF_NATIVE_RESTORE_DONE: context=%p seq=%d state_bytes=%zu next_position=%d\n",
                 (void *) ctx_.get(), (int) sequence_id_,
                 handoff.sequence_state.size(), (int) handoff.next_position);
+        const char * trace = std::getenv("LLAMA_GEN_DECODE_TRACE");
+        if (trace != nullptr && std::strcmp(trace, "1") == 0) {
+            fprintf(stderr,
+                    "HANDOFF_EFFECTIVE_CONFIG context=%p seed=%u temperature=%.6f state_checksum=%llu logits_checksum=%llu\n",
+                    (void *) ctx_.get(), handoff.sampling_params.seed, handoff.sampling_params.temp,
+                    static_cast<unsigned long long>(handoff.sequence_state_checksum),
+                    static_cast<unsigned long long>(handoff.final_logits_checksum));
+        }
 
         if (!llama_kv_cache_cluster_rebuild_after_restore(
                     ctx_.get(), sequence_id_)) {

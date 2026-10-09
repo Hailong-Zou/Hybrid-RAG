@@ -33,7 +33,8 @@ public:
             llama_seq_id sequence_id = 0,
             bool conflayer_enabled = false,
             int32_t conflayer_max_skip_layers = 10,
-            bool conflayer_ngram_spec_enabled = false);
+            bool conflayer_ngram_spec_enabled = false,
+            bool reclaim_zero_kv_control = false);
 
     ~server_generation_decode_executor();
 
@@ -70,6 +71,7 @@ public:
 
 private:
     llama_model * model_ = nullptr; // non-owning
+    bool reclaim_zero_kv_ = false;
 
     llama_context_ptr ctx_;
     common_sampler_ptr sampler_;

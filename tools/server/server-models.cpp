@@ -2695,10 +2695,11 @@ void server_models_routes::init_routes() {
                         prefill_id,
                         decode_id);
 
-                // Keep NPU prefills independent, but serialize CPU decode.
-                // One persistent 4-thread Decode Context is reused across
-                // all candidates to avoid memory-bandwidth contention.
-                if (candidate_index > 0) {
+                // Parallel consumers own one executor per server slot.
+                const char * parallel_decode = std::getenv("LLAMA_RAG_PARALLEL_DECODE");
+                const bool parallel_decode_enabled = parallel_decode != nullptr &&
+                        std::strcmp(parallel_decode, "1") == 0;
+                if (!parallel_decode_enabled && candidate_index > 0) {
                     const int previous_decode_id =
                             generation_decode_base_id +
                             static_cast<int>(candidate_index - 1);

@@ -1025,6 +1025,10 @@ RagTaskResult RagServerExecutor::execute(const RagTaskContext & ctx) {
                 }
             } else {
                 try {
+                    const char * parallel_decode = std::getenv("LLAMA_RAG_PARALLEL_DECODE");
+                    const bool parallel_decode_enabled = parallel_decode != nullptr &&
+                            std::strcmp(parallel_decode, "1") == 0;
+
                     const json response =
                             models_->request_model_json(
                                     req.generation_model,
@@ -1081,12 +1085,9 @@ RagTaskResult RagServerExecutor::execute(const RagTaskContext & ctx) {
                                             req
                                                     .generation_decode_backend,
                                         },
-                                        // Reuse one persistent CPU Decode Context for all
-                                        // generation candidates. Two concurrent 4-thread
-                                        // decode lanes were measured to halve per-lane
-                                        // throughput without improving aggregate throughput.
+                                        // Independent slots own independent KV and samplers.
                                         {"id_slot",
-                                         0},
+                                         parallel_decode_enabled ? static_cast<int>(ctx.candidate_index) : 0},
                                         {
                                             "backend_sampling",
                                             false,

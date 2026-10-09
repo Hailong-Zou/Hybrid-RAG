@@ -2755,17 +2755,23 @@ private:
 
                     auto run_shadow =
                             [&](const char * label,
-                                bool enable_ngram) {
+                                bool enable_ngram,
+                                bool enable_conflayer = true) {
+                        const char * limit_env = std::getenv("LLAMA_NGRAM_DIAG_SHADOW_TOKENS");
+                        const int limit = limit_env == nullptr ? 8 : std::atoi(limit_env);
+                        if (limit < 1 || limit > 64) {
+                            throw std::runtime_error("shadow token limit must be 1..64");
+                        }
                         server_generation_decode_executor executor(
                                 decode_model,
                                 shadow_context_params,
                                 0,
-                                params_base.conflayer,
+                                enable_conflayer && params_base.conflayer,
                                 params_base.conflayer_max_skip_layers,
                                 enable_ngram);
 
                         std::vector<llama_token> tokens;
-                        tokens.reserve(8);
+                        tokens.reserve(limit);
 
                         llama_token token =
                                 executor.begin(
@@ -2774,19 +2780,20 @@ private:
                         tokens.push_back(token);
 
                         for (int step = 1;
-                                step < 8 &&
+                                step < limit &&
                                 !llama_vocab_is_eog(
                                         shadow_vocab,
                                         token);
                                 ++step) {
                             token =
                                     executor.decode_next(
-                                            8 - step);
+                                            limit - step);
 
                             tokens.push_back(token);
                         }
 
                         std::string csv;
+                        std::string content;
 
                         for (std::size_t i = 0;
                                 i < tokens.size();
@@ -2798,7 +2805,13 @@ private:
                             csv +=
                                     std::to_string(
                                             tokens[i]);
+                            content += common_token_to_piece(shadow_vocab, tokens[i], false);
                         }
+                        fprintf(stderr,
+                                "QUALITY_SHADOW_CONTENT label=%s conflayer=%d tree=%d seed=%u temperature=%.6f content_json=%s\n",
+                                label, (int) enable_conflayer, (int) enable_ngram,
+                                stored_generation_handoff->sampling_params.seed,
+                                stored_generation_handoff->sampling_params.temp, json(content).dump().c_str());
 
                         fprintf(
                                 stderr,
@@ -2818,6 +2831,11 @@ private:
 
                         return tokens;
                     };
+
+                    const char * full_cpu = std::getenv("LLAMA_NGRAM_DIAG_SHADOW_FULL_CPU");
+                    if (full_cpu != nullptr && std::strcmp(full_cpu, "1") == 0) {
+                        run_shadow("FULL_CPU", false, false);
+                    }
 
                     const auto seq_tokens =
                             run_shadow(
@@ -2883,7 +2901,10 @@ private:
                 // Diagnostic fixed-handoff replay:
                 // recreate the Decode executor for every consumption so
                 // runtime B/D configuration and n_seq_max are refreshed.
+                const char * persistent_replay = std::getenv("LLAMA_HANDOFF_REPLAY_PERSISTENT");
                 if (handoff_replay_keep &&
+                        !(persistent_replay != nullptr &&
+                          std::strcmp(persistent_replay, "1") == 0) &&
                         slot.generation_decode_executor) {
                     slot.generation_decode_executor->reset();
                     slot.generation_decode_executor.reset();
@@ -2904,7 +2925,9 @@ private:
                                         0,
                                         params_base.conflayer,
                                         params_base.conflayer_max_skip_layers,
-                                        params_base.conflayer_ngram_spec);
+                                        params_base.conflayer_ngram_spec,
+                                        slot.id == 0 && std::getenv("LLAMA_KV_ZERO_RECLAIM_CONTROL_SLOT0") != nullptr &&
+                                        std::strcmp(std::getenv("LLAMA_KV_ZERO_RECLAIM_CONTROL_SLOT0"), "1") == 0);
                 }
 
                 log_memory_account("DECODE_CPU_CONTEXT_GRAPH_READY", slot.id, generation_handoff_handle);
@@ -4285,10 +4308,28 @@ private:
                     std::async(
                             std::launch::async,
                             [&slot]() {
-                                return slot
+                                const char * enabled = std::getenv("LLAMA_RAG_PARALLEL_DECODE");
+                                const char * trace_env = std::getenv("LLAMA_GEN_DECODE_TRACE");
+                                const bool trace = (enabled != nullptr && std::strcmp(enabled, "1") == 0) ||
+                                        (trace_env != nullptr && std::strcmp(trace_env, "1") == 0);
+                                const auto * context = slot.generation_decode_executor->context();
+                                if (trace) {
+                                    std::fprintf(stderr,
+                                            "GEN_DECODE_EVAL phase=begin timestamp_us=%lld slot=%d context=%p\n",
+                                            static_cast<long long>(ggml_time_us()), slot.id,
+                                            static_cast<const void *>(context));
+                                }
+                                const llama_token token = slot
                                         .generation_decode_executor
                                         ->decode_next(
                                                 slot.n_remaining);
+                                if (trace) {
+                                    std::fprintf(stderr,
+                                            "GEN_DECODE_EVAL phase=end timestamp_us=%lld slot=%d context=%p token=%d\n",
+                                            static_cast<long long>(ggml_time_us()), slot.id,
+                                            static_cast<const void *>(context), static_cast<int>(token));
+                                }
+                                return token;
                             }));
         });
 
