@@ -1,6 +1,7 @@
 #pragma once
 
 #include "llama.h"
+#include "llama-ext.h"
 #include "llama-arch.h"
 #include "llama-graph.h"
 #include "llama-hparams.h"
@@ -649,6 +650,7 @@ struct llama_model {
     llama_split_mode split_mode() const;
 
     std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const;
+    void visit_memory_regions(llama_memory_region_callback callback, void * userdata) const;
 
     // total number of parameters in the model
     uint64_t n_elements() const;
@@ -732,6 +734,7 @@ llama_model * llama_model_create(llama_model_loader & ml, const llama_model_para
 // model must inherit from this
 struct llama_model_base : public llama_model {
     friend struct llama_model;
+    friend void llama_model_visit_memory_regions(const struct llama_model * model, llama_memory_region_callback callback, void * userdata);
 
     llama_model * model;
     llama_model_loader * ml = nullptr;

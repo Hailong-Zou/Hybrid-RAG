@@ -34,6 +34,19 @@
 #include <chrono>
 #include <set>
 #include <cstring>
+#include <array>
+#include <cerrno>
+#include <cstdlib>
+#include <map>
+#include <limits>
+#include <sstream>
+#include <tuple>
+#include <unordered_set>
+#include <vector>
+#if defined(__linux__)
+#include <sys/mman.h>
+#include <unistd.h>
+#endif
 
 // fix problem with std::min and std::max
 #if defined(_WIN32)
@@ -46,6 +59,245 @@
 
 using json = nlohmann::ordered_json;
 
+
+struct physical_map_region {
+    std::uintptr_t begin = 0;
+    std::uintptr_t end = 0;
+    std::uint64_t file_offset = 0;
+    unsigned int dev_major = 0;
+    unsigned int dev_minor = 0;
+    std::uint64_t inode = 0;
+    std::string path;
+    bool gguf = false;
+};
+
+struct physical_memory_range {
+    std::uintptr_t begin;
+    std::uintptr_t end;
+    llama_memory_region_kind kind;
+};
+
+struct physical_memory_account {
+    std::array<std::size_t, 4> allocated{};
+    std::array<std::size_t, 4> resident{};
+    std::array<std::size_t, 4> range_mincore_calls{};
+    std::array<std::size_t, 4> range_mincore_failures{};    const char * event = "unknown";
+    const char * model_name = "unknown";
+    std::size_t gguf_logical = 0;
+    std::size_t gguf_resident = 0;
+    std::size_t device_private_allocated = 0;
+    std::size_t no_address_allocated = 0;
+    std::size_t shared_mixed_resident = 0;
+    std::size_t mincore_calls = 0;
+    std::size_t mincore_failures = 0;
+    std::size_t map_count = 0;
+    std::size_t probe_buffer_peak_bytes = 0;
+    std::uint64_t memavailable_bytes = 0;
+    int last_errno = 0;
+    std::vector<physical_memory_range> ranges;
+};
+
+static int physical_kind_index(llama_memory_region_kind kind) {
+    const int value = static_cast<int>(kind);
+    return value >= 0 && value < 4 ? value : 3;
+}
+
+static void physical_memory_region_callback(void * userdata, const void * base,
+        std::size_t size, llama_memory_region_kind kind, ggml_backend_buffer_type_t buft) {
+    auto * account = static_cast<physical_memory_account *>(userdata);
+    const int index = physical_kind_index(kind);
+    account->allocated[index] += size;
+    if (size == 0) {
+        return;
+    }
+    const char * backend_name = buft == nullptr ? nullptr : ggml_backend_buft_name(buft);
+    if (backend_name != nullptr && std::strncmp(backend_name, "HTP", 3) == 0) {
+        account->device_private_allocated += size;
+        const char * enabled = std::getenv("LLAMA_DMA_BACKING_DIAG");
+        if (enabled != nullptr && enabled[0] == '1') {
+#if defined(__linux__)
+            const long dma_pid = static_cast<long>(getpid());
+#else
+            const long dma_pid = -1;
+#endif
+            std::fprintf(stderr,
+                    "HTP_DMA_BIND ts_epoch_ns=%lld pid=%ld model=%s event=%s category=%s ptr=%p logical_bytes=%zu backend=%s\n",
+                    static_cast<long long>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                            std::chrono::system_clock::now().time_since_epoch()).count()),
+                    dma_pid, account->model_name, account->event,
+                    index == 0 ? "model" : index == 1 ? "kv" : index == 2 ? "runtime" : "intermediate",
+                    base, size, backend_name);
+        }
+        return;
+    }
+    if (buft != nullptr && !ggml_backend_buft_is_host(buft)) {
+        account->device_private_allocated += size;
+        return;
+    }
+    if (base == nullptr || buft == nullptr) {
+        account->no_address_allocated += size;
+        return;
+    }
+    const auto begin = reinterpret_cast<std::uintptr_t>(base);
+    if (size > std::numeric_limits<std::uintptr_t>::max() - begin) {
+        account->no_address_allocated += size;
+        return;
+    }
+    account->ranges.push_back({begin, begin + size, kind});
+}
+
+static void physical_memory_add_intermediate(physical_memory_account & account,
+        const void * base, std::size_t size) {
+    account.allocated[3] += size;
+    if (base == nullptr || size == 0) {
+        account.no_address_allocated += size;
+        return;
+    }
+    const auto begin = reinterpret_cast<std::uintptr_t>(base);
+    if (size > std::numeric_limits<std::uintptr_t>::max() - begin) {
+        account.no_address_allocated += size;
+        return;
+    }
+    account.ranges.push_back({begin, begin + size, LLAMA_MEMORY_REGION_INTERMEDIATE});
+}
+
+static physical_memory_account physical_memory_probe(physical_memory_account account) {
+#if defined(__linux__)
+    const long page_size_long = sysconf(_SC_PAGESIZE);
+    if (page_size_long <= 0) {
+        account.last_errno = errno;
+        account.mincore_failures++;
+        return account;
+    }
+    const auto page_size = static_cast<std::uintptr_t>(page_size_long);
+    std::vector<physical_map_region> maps;
+    std::ifstream maps_file("/proc/self/maps");
+    std::string line;
+    while (std::getline(maps_file, line)) {
+        std::istringstream input(line);
+        std::string address, perms, offset, device;
+        std::uint64_t inode = 0;
+        if (!(input >> address >> perms >> offset >> device >> inode)) {
+            continue;
+        }
+        const auto dash = address.find('-');
+        const auto colon = device.find(':');
+        if (dash == std::string::npos || colon == std::string::npos) {
+            continue;
+        }
+        physical_map_region region;
+        try {
+            region.begin = std::stoull(address.substr(0, dash), nullptr, 16);
+            region.end = std::stoull(address.substr(dash + 1), nullptr, 16);
+            region.file_offset = std::stoull(offset, nullptr, 16);
+            region.dev_major = static_cast<unsigned int>(std::stoul(device.substr(0, colon), nullptr, 16));
+            region.dev_minor = static_cast<unsigned int>(std::stoul(device.substr(colon + 1), nullptr, 16));
+        } catch (...) {
+            continue;
+        }
+        region.inode = inode;
+        std::getline(input, region.path);
+        const auto first = region.path.find_first_not_of(' ');
+        if (first == std::string::npos) {
+            region.path.clear();
+        } else {
+            region.path.erase(0, first);
+        }
+        region.gguf = region.path.find(".gguf") != std::string::npos && inode != 0;
+        maps.push_back(std::move(region));
+    }
+    account.map_count = maps.size();
+
+    using file_key = std::tuple<unsigned int, unsigned int, std::uint64_t>;
+    std::vector<const physical_map_region *> gguf_maps;
+    for (const auto & region : maps) {
+        if (region.gguf) gguf_maps.push_back(&region);
+    }
+    std::sort(gguf_maps.begin(), gguf_maps.end(), [](const auto * a, const auto * b) {
+        return std::tie(a->dev_major, a->dev_minor, a->inode, a->file_offset) <
+               std::tie(b->dev_major, b->dev_minor, b->inode, b->file_offset);
+    });
+    std::map<file_key, std::uint64_t> file_page_end;
+    std::vector<unsigned char> vec;
+    for (const auto * region : gguf_maps) {
+        const std::size_t n_pages = (region->end - region->begin) / page_size;
+        if (n_pages == 0) continue;
+        const auto first_file_page = region->file_offset / page_size;
+        const auto last_file_page = first_file_page + n_pages;
+        const file_key key{region->dev_major, region->dev_minor, region->inode};
+        auto & covered_end = file_page_end[key];
+        const auto unique_first = std::max(first_file_page, covered_end);
+        const auto unique_pages = last_file_page > unique_first ? last_file_page - unique_first : 0;
+        if (unique_pages == 0) continue;
+        vec.resize(n_pages);
+        account.probe_buffer_peak_bytes = std::max(account.probe_buffer_peak_bytes, vec.capacity());
+        account.gguf_logical += unique_pages * page_size;
+        account.mincore_calls++;
+        if (mincore(reinterpret_cast<void *>(region->begin), region->end - region->begin, vec.data()) != 0) {
+            account.mincore_failures++;
+            account.last_errno = errno;
+        } else {
+            for (std::size_t i = 0; i < n_pages; ++i) {
+                if (first_file_page + i >= unique_first && (vec[i] & 1) != 0) {
+                    account.gguf_resident += page_size;
+                }
+            }
+        }
+        covered_end = std::max(covered_end, last_file_page);
+    }
+
+    std::sort(account.ranges.begin(), account.ranges.end(), [](const auto & a, const auto & b) {
+        if (a.kind != b.kind) return a.kind < b.kind;
+        return a.begin < b.begin;
+    });
+    std::unordered_set<std::uintptr_t> seen_resident_pages;
+    const auto is_gguf_address = [&](std::uintptr_t address) {
+        auto it = std::upper_bound(maps.begin(), maps.end(), address,
+                [](std::uintptr_t value, const physical_map_region & item) { return value < item.begin; });
+        if (it == maps.begin()) return false;
+        --it;
+        return it->gguf && address < it->end;
+    };
+    for (const auto & range : account.ranges) {
+        if (range.end <= range.begin) continue;
+        const auto begin = range.begin & ~(page_size - 1);
+        const auto end = (range.end + page_size - 1) & ~(page_size - 1);
+        if (end <= begin) continue;
+        const std::size_t n_pages = (end - begin) / page_size;
+        vec.resize(n_pages);
+        account.probe_buffer_peak_bytes = std::max(account.probe_buffer_peak_bytes, vec.capacity());
+        const int kind = physical_kind_index(range.kind);
+        account.mincore_calls++;
+        account.range_mincore_calls[kind]++;
+        if (mincore(reinterpret_cast<void *>(begin), end - begin, vec.data()) != 0) {
+            account.mincore_failures++;
+            account.range_mincore_failures[kind]++;
+            account.last_errno = errno;
+            continue;
+        }
+        for (std::size_t i = 0; i < n_pages; ++i) {
+            if ((vec[i] & 1) == 0) continue;
+            const auto page = begin + i * page_size;
+            if (is_gguf_address(page)) continue;
+            if (!seen_resident_pages.insert(page).second) continue;
+            account.resident[kind] += page_size;
+        }
+    }
+
+    std::ifstream meminfo("/proc/meminfo");
+    std::string key, unit;
+    std::uint64_t value = 0;
+    while (meminfo >> key >> value >> unit) {
+        if (key == "MemAvailable:") {
+            account.memavailable_bytes = value * 1024;
+            break;
+        }
+    }
+#else
+    account.mincore_failures++;
+#endif
+    return account;
+}
 constexpr int HTTP_POLLING_SECONDS = 1;
 
 static uint32_t server_n_outputs_max(const common_params & params) {
@@ -192,6 +444,8 @@ struct server_slot {
 
     // used to determine the slot that has been used the longest
     int64_t t_last_used = -1;
+    // Rate-limit memory snapshots at completed graph/token boundaries.
+    int64_t t_last_physical_sample_us = 0;
 
     // generation props
     int32_t n_ctx       = 0;  // context size per slot
@@ -1095,6 +1349,69 @@ private:
                 slot_id, handle, weights_bytes, weights_mmap_logical_bytes,
                 kv_bytes, runtime_bytes, handoff_capacity_bytes, known_total,
                 seen_contexts.size(), handoff_count);
+        physical_memory_account physical;
+        physical.event = event;
+        physical.model_name = model_name.c_str();
+        for (const auto * model : seen_models) {
+            llama_model_visit_memory_regions(model, physical_memory_region_callback, &physical);
+        }
+        for (const auto * ctx : seen_contexts) {
+            llama_context_visit_memory_regions(ctx, physical_memory_region_callback, &physical);
+        }
+        const auto add_handoff_ranges = [&](const server_generation_handoff * h) {
+            if (h == nullptr) return;
+            physical_memory_add_intermediate(physical, h->sequence_state.data(), h->sequence_state.capacity());
+            physical_memory_add_intermediate(physical, h->final_logits.data(), h->final_logits.capacity() * sizeof(float));
+            physical_memory_add_intermediate(physical, h->prompt_tokens.data(), h->prompt_tokens.capacity() * sizeof(llama_token));
+        };
+        for (const auto & [_, h] : generation_handoffs) add_handoff_ranges(h.get());
+        for (const auto & slot : slots) add_handoff_ranges(slot.generation_handoff.get());
+        physical = physical_memory_probe(std::move(physical));
+
+        const char * baseline_env = std::getenv("LLAMA_MEM_AVAILABLE_BASELINE_BYTES");
+        char baseline_text[32] = "unavailable";
+        char increment_text[32] = "unavailable";
+        std::uint64_t baseline_bytes = 0;
+        if (baseline_env != nullptr && baseline_env[0] != '\0' && physical.memavailable_bytes != 0) {
+            baseline_bytes = std::strtoull(baseline_env, nullptr, 10);
+            std::snprintf(baseline_text, sizeof(baseline_text), "%" PRIu64, baseline_bytes);
+            const std::uint64_t increment = baseline_bytes > physical.memavailable_bytes
+                    ? baseline_bytes - physical.memavailable_bytes : 0;
+            std::snprintf(increment_text, sizeof(increment_text), "%" PRIu64, increment);
+        }
+        const std::size_t model_resident = physical.gguf_resident + physical.resident[0];
+        const std::size_t classified_resident = model_resident + physical.resident[1] +
+                physical.resident[2] + physical.resident[3];
+#if defined(__linux__)
+        const long process_id = static_cast<long>(getpid());
+#else
+        const long process_id = -1;
+#endif
+        const auto physical_ts_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::system_clock::now().time_since_epoch()).count();
+        std::fprintf(stderr,
+                "RAG_PHYS_MEM_SNAPSHOT ts_epoch_ns=%lld pid=%ld model=%s event=%s slot=%d handle=%" PRIu64 " "
+                "model_alloc_bytes=%zu model_resident_bytes=%zu cpu_gguf_logical_bytes=%zu cpu_gguf_resident_bytes=%zu "
+                "kv_alloc_bytes=%zu kv_resident_bytes=%zu runtime_alloc_bytes=%zu runtime_resident_bytes=%zu "
+                "intermediate_alloc_bytes=%zu intermediate_resident_bytes=%zu shared_mixed_resident_bytes=%zu "
+                "device_private_alloc_bytes=%zu device_private_resident_bytes=unobservable no_address_alloc_bytes=%zu "
+                "classified_resident_bytes=%zu memavailable_bytes=%" PRIu64 " baseline_memavailable_bytes=%s system_increment_bytes=%s "
+                "mincore_calls=%zu mincore_failures=%zu errno=%d maps=%zu probe_buffer_peak_bytes=%zu "
+                "host_model_calls=%zu host_model_failures=%zu host_kv_calls=%zu host_kv_failures=%zu "
+                "host_runtime_calls=%zu host_runtime_failures=%zu host_intermediate_calls=%zu host_intermediate_failures=%zu "
+                "resident_scope=direct_pointer_mincore\n",
+                static_cast<long long>(physical_ts_ns), process_id, model_name.c_str(), event, slot_id, handle,
+                physical.allocated[0], model_resident, physical.gguf_logical, physical.gguf_resident,
+                physical.allocated[1], physical.resident[1], physical.allocated[2], physical.resident[2],
+                physical.allocated[3], physical.resident[3], physical.shared_mixed_resident,
+                physical.device_private_allocated, physical.no_address_allocated, classified_resident,
+                physical.memavailable_bytes, baseline_text, increment_text, physical.mincore_calls,
+                physical.mincore_failures, physical.last_errno, physical.map_count,
+                physical.probe_buffer_peak_bytes,
+                physical.range_mincore_calls[0], physical.range_mincore_failures[0],
+                physical.range_mincore_calls[1], physical.range_mincore_failures[1],
+                physical.range_mincore_calls[2], physical.range_mincore_failures[2],
+                physical.range_mincore_calls[3], physical.range_mincore_failures[3]);
     }
 
     void destroy() {
@@ -1376,11 +1693,16 @@ private:
             // mmap-backed model; Decode-side ConFLayer streaming is controlled
             // separately by decode_context_params.layer_chunks.
             params_decode_cpu.layer_chunks = 0;
+            params_decode_cpu.no_mmap_prefetch = true;
+            // The CPU model is loaded model-only; no forward warmup is needed.
+            params_decode_cpu.warmup = false;
 
             // The target NPU model may require --no-mmap, but the dedicated
             // CPU decode model should use mmap to avoid duplicating the full
             // model weights in resident memory.
             params_decode_cpu.use_mmap = true;
+            // Direct I/O is producer-only; never inherit it into the CPU mmap model.
+            params_decode_cpu.use_direct_io = false;
 
             // An explicit, null-terminated CPU device list prevents the
             // model loader from auto-selecting Hexagon or another
@@ -1405,8 +1727,11 @@ private:
 
             SRV_WRN(
                     "DECODE_CPU_MODEL_CONFIG: layer_chunks=%d "
+                    "no_mmap_prefetch=%d warmup=%d "
                     "no_extra_bufts=%d use_mmap=%d n_gpu_layers=%d\n",
                     params_decode_cpu.layer_chunks,
+                    params_decode_cpu.no_mmap_prefetch ? 1 : 0,
+                    params_decode_cpu.warmup ? 1 : 0,
                     params_decode_cpu.no_extra_bufts ? 1 : 0,
                     params_decode_cpu.use_mmap ? 1 : 0,
                     params_decode_cpu.n_gpu_layers);
@@ -1438,6 +1763,7 @@ private:
                     "dedicated CPU Generation Decode model loaded "
                     "on device %s\n",
                     ggml_backend_dev_name(cpu_device));
+            log_memory_account("DECODE_CPU_MODEL_MMAP_READY");
         }
 
         vocab = llama_model_get_vocab(model_tgt);
@@ -2581,6 +2907,7 @@ private:
                                         params_base.conflayer_ngram_spec);
                 }
 
+                log_memory_account("DECODE_CPU_CONTEXT_GRAPH_READY", slot.id, generation_handoff_handle);
                 // begin() validates and restores the sequence state,
                 // reconstructs the sampler, and samples the first token.
                 first_token =
@@ -2964,6 +3291,16 @@ private:
         }
 
         slot.print_timings_tg();
+        const int64_t token_sample_now_us = ggml_time_us();
+        if (slot.n_decoded == 1 || slot.t_last_physical_sample_us == 0 ||
+                token_sample_now_us - slot.t_last_physical_sample_us >= 100000) {
+            const std::uint64_t handoff_handle =
+                    slot.task->params.generation_handoff_handle;
+            log_memory_account(handoff_handle != 0
+                    ? "GEN_DECODE_TOKEN_SAMPLE"
+                    : "COMPLETION_TOKEN_SAMPLE", slot.id, handoff_handle);
+            slot.t_last_physical_sample_us = ggml_time_us();
+        }
         return true;
     }
 
@@ -3351,6 +3688,7 @@ private:
                     }
 
                     const int id_task = task.id;
+                    const auto task_type = task.type;
 
                     server_slot * slot = get_available_slot(task);
 
@@ -3388,6 +3726,13 @@ private:
                     } else if (!launch_slot_with_task(*slot, std::move(task))) {
                         SRV_ERR("failed to launch slot with task, id_task = %d\n", id_task);
                         break; // drop the task
+                    }
+                    if (task_type == SERVER_TASK_TYPE_EMBEDDING) {
+                        log_memory_account("EMBEDDING_REQUEST_BEGIN", slot->id);
+                    } else if (task_type == SERVER_TASK_TYPE_RERANK) {
+                        log_memory_account("RERANK_REQUEST_BEGIN", slot->id);
+                    } else if (task_type == SERVER_TASK_TYPE_COMPLETION) {
+                        log_memory_account("COMPLETION_REQUEST_BEGIN", slot->id);
                     }
 
                     if (params_base.cache_idle_slots) {
@@ -4694,6 +5039,23 @@ private:
             return false; // retry with the updated n_batch
         }
 
+        // Sample generation prefill only after a completed graph. This avoids
+        // concurrent reads of KV/backend state and limits diagnostic overhead.
+        const int64_t prefill_sample_now_us = ggml_time_us();
+        for (auto & slot : slots) {
+            if (slot.state != SLOT_STATE_PROCESSING_PROMPT || !slot.task ||
+                    !slot.task->params.generation_handoff ||
+                    !slot.task->params.generation_prefill_only) {
+                continue;
+            }
+            if (slot.t_last_physical_sample_us == 0 ||
+                    prefill_sample_now_us - slot.t_last_physical_sample_us >= 100000) {
+                log_memory_account("GEN_PREFILL_BATCH_SAMPLE", slot.id,
+                        slot.task->params.generation_handoff_handle);
+                slot.t_last_physical_sample_us = ggml_time_us();
+            }
+        }
+
         // TODO: avoid restoring the draft context and re-evaluating the drafted tokens when not needed [TAG_SPEC_AVOID_DRAFT_REEVAL]
         //       for now, always re-evaluate for simplicity
         //       ref: https://github.com/ggml-org/llama.cpp/pull/22728#issuecomment-4400925384
@@ -4774,6 +5136,7 @@ private:
                 if (slot.task->type == SERVER_TASK_TYPE_EMBEDDING) {
                     // prompt evaluated for embedding
                     send_embedding(slot, batch_view);
+                    log_memory_account("EMBEDDING_REQUEST_END", slot.id);
                     slot.release();
                     slot.i_batch = -1;
                     return;
@@ -4781,6 +5144,7 @@ private:
 
                 if (slot.task->type == SERVER_TASK_TYPE_RERANK) {
                     send_rerank(slot, batch_view);
+                    log_memory_account("RERANK_REQUEST_END", slot.id);
                     slot.release();
                     slot.i_batch = -1;
                     return;
@@ -5098,6 +5462,7 @@ private:
                                         params_base.conflayer_ngram_spec);
                 }
 
+                log_memory_account("DECODE_CPU_CONTEXT_GRAPH_READY", slot.id);
                 const llama_token first_token =
                         slot.generation_decode_executor->begin(
                                 *slot.generation_handoff);

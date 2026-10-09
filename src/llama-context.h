@@ -260,6 +260,7 @@ public:
     bool set_sampler(llama_seq_id seq_id, llama_sampler * sampler);
 
 private:
+    friend void llama_context_visit_memory_regions(const struct llama_context * ctx, llama_memory_region_callback callback, void * userdata);
     llm_graph_params graph_params(
                         llm_graph_result * res,
                       const llama_ubatch & ubatch,

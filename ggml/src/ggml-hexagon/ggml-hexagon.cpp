@@ -25,6 +25,7 @@
 #else
 #    include <semaphore.h>
 #    include <unistd.h>
+#    include <sys/stat.h>
 #endif
 
 #pragma clang diagnostic ignored "-Wnested-anon-types"
@@ -322,6 +323,38 @@ struct ggml_hexagon_shared_buffer {
     int                    fd;
     bool                   mapped;
     bool                   pinned;
+    const char *           purpose;
+
+    void log_dma_backing(const char * phase) const {
+#ifndef _WIN32
+        const char * enabled = getenv("LLAMA_DMA_BACKING_DIAG");
+        if (enabled == nullptr || enabled[0] != '1' || this->fd < 0) return;
+
+        struct stat st = {};
+        const bool stat_ok = fstat(this->fd, &st) == 0;
+        size_t backing_bytes = 0;
+        char exporter[96] = "unavailable";
+        char path[96];
+        snprintf(path, sizeof(path), "/proc/self/fdinfo/%d", this->fd);
+        if (FILE * info = fopen(path, "r")) {
+            char line[160];
+            while (fgets(line, sizeof(line), info)) {
+                size_t value = 0;
+                if (sscanf(line, "size: %zu", &value) == 1) backing_bytes = value;
+                sscanf(line, "exp_name: %95s", exporter);
+            }
+            fclose(info);
+        }
+        const auto dma_timestamp_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::system_clock::now().time_since_epoch()).count();
+        GGML_LOG_WARN("HTP_DMA_%s ts_epoch_ns=%lld pid=%ld ptr=%p fd=%d inode=%ju logical_bytes=%zu backing_bytes=%zu exporter=%s backend=%s purpose=%s\n",
+                phase, static_cast<long long>(dma_timestamp_ns), static_cast<long>(getpid()), static_cast<void *>(this->base),
+                this->fd, stat_ok ? static_cast<uintmax_t>(st.st_ino) : uintmax_t(0),
+                this->size, backing_bytes, exporter, sess->c_name(), purpose);
+#else
+        (void) phase;
+#endif
+    }
 
     void mmap() {
         fastrpc_map_flags flags = this->pinned ? FASTRPC_MAP_FD : FASTRPC_MAP_FD_DELAYED;
@@ -372,6 +405,7 @@ struct ggml_hexagon_shared_buffer {
         }
         this->size = size;
 
+        log_dma_backing("ALLOC");
         HEX_VERBOSE("ggml-hex: %s allocated buffer: base %p size %zu fd %d pinned %d\n", sess->c_name(),
                     (void *) this->base, this->size, this->fd, (int) pinned);
         mmap();
@@ -380,6 +414,7 @@ struct ggml_hexagon_shared_buffer {
     void free() {
         if (!this->base) return;
 
+        log_dma_backing("FREE");
         unmap();
         rpcmem_free(this->base);
 
@@ -389,13 +424,15 @@ struct ggml_hexagon_shared_buffer {
         this->base = NULL;
     }
 
-    ggml_hexagon_shared_buffer(ggml_hexagon_session * sess, size_t size, bool pinned = false) {
+    ggml_hexagon_shared_buffer(ggml_hexagon_session * sess, size_t size, bool pinned = false,
+                               const char * purpose = "backend-buffer") {
         this->sess   = sess;
         this->size   = 0;
         this->base   = nullptr;
         this->fd     = -1;
         this->mapped = false;
         this->pinned = pinned;
+        this->purpose = purpose;
 
         alloc(size);
     }
@@ -1970,7 +2007,7 @@ struct ggml_hexagon_opqueue {
                        sizeof(htp_prof_desc) * n_ops     +
                        tr_size;
 
-        shm_buf = new ggml_hexagon_shared_buffer(sess, shm_blk_size * depth, true /* pinned */);
+        shm_buf = new ggml_hexagon_shared_buffer(sess, shm_blk_size * depth, true /* pinned */, "runtime.opqueue");
 
         op_cache.resize(depth);
         start_usec.resize(depth, 0);

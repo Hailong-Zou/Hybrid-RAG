@@ -28,6 +28,7 @@ extern "C" {
     typedef void * ggml_backend_graph_plan_t;
     typedef struct ggml_backend_reg * ggml_backend_reg_t;
     typedef struct ggml_backend_device * ggml_backend_dev_t;
+    typedef void (*ggml_backend_buffer_visit_cb)(void * userdata, void * base, size_t size, ggml_backend_buffer_type_t buft);
 
 
     //
@@ -65,6 +66,7 @@ extern "C" {
     GGML_API void                           ggml_backend_buffer_set_usage     (ggml_backend_buffer_t buffer, enum ggml_backend_buffer_usage usage);
     GGML_API enum ggml_backend_buffer_usage ggml_backend_buffer_get_usage     (ggml_backend_buffer_t buffer);
     GGML_API ggml_backend_buffer_type_t     ggml_backend_buffer_get_type      (ggml_backend_buffer_t buffer);
+    GGML_API void                           ggml_backend_buffer_visit          (ggml_backend_buffer_t buffer, ggml_backend_buffer_visit_cb callback, void * userdata);
     GGML_API void                           ggml_backend_buffer_reset         (ggml_backend_buffer_t buffer);
 
     // tensor copy between different backends
@@ -330,6 +332,8 @@ extern "C" {
 
     GGML_API ggml_backend_buffer_type_t ggml_backend_sched_get_buffer_type(ggml_backend_sched_t sched, ggml_backend_t backend);
     GGML_API size_t                     ggml_backend_sched_get_buffer_size(ggml_backend_sched_t sched, ggml_backend_t backend);
+    GGML_API int                        ggml_backend_sched_get_buffer_count(ggml_backend_sched_t sched, ggml_backend_t backend);
+    GGML_API ggml_backend_buffer_t      ggml_backend_sched_get_buffer(ggml_backend_sched_t sched, ggml_backend_t backend, int chunk_id);
 
     GGML_API void                 ggml_backend_sched_set_tensor_backend(ggml_backend_sched_t sched, struct ggml_tensor * node, ggml_backend_t backend);
     GGML_API ggml_backend_t       ggml_backend_sched_get_tensor_backend(ggml_backend_sched_t sched, struct ggml_tensor * node);

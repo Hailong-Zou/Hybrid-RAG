@@ -4,6 +4,7 @@
 #include "llama-graph.h"
 #include "llama-kv-cells.h"
 #include "llama-memory.h"
+#include "llama-ext.h"
 
 #include <unordered_map>
 #include <vector>
@@ -225,6 +226,7 @@ public:
     void set_input_v_rot(ggml_tensor * dst) const;
 
 private:
+    friend void llama_context_visit_memory_regions(const struct llama_context * ctx, llama_memory_region_callback callback, void * userdata);
     const llama_model & model;
     const llama_hparams & hparams;
 

@@ -725,6 +725,20 @@ bool ggml_backend_buffer_is_multi_buffer(ggml_backend_buffer_t buffer) {
     return buffer->iface.free_buffer == ggml_backend_multi_buffer_free_buffer;
 }
 
+void ggml_backend_buffer_visit(ggml_backend_buffer_t buffer, ggml_backend_buffer_visit_cb callback, void * userdata) {
+    if (buffer == NULL || callback == NULL) {
+        return;
+    }
+    if (ggml_backend_buffer_is_multi_buffer(buffer)) {
+        ggml_backend_multi_buffer_context * ctx = (ggml_backend_multi_buffer_context *) buffer->context;
+        for (size_t i = 0; i < ctx->n_buffers; ++i) {
+            ggml_backend_buffer_visit(ctx->buffers[i], callback, userdata);
+        }
+        return;
+    }
+    callback(userdata, ggml_backend_buffer_get_base(buffer), ggml_backend_buffer_get_size(buffer), ggml_backend_buffer_get_type(buffer));
+}
+
 void ggml_backend_multi_buffer_set_usage(ggml_backend_buffer_t buffer, enum ggml_backend_buffer_usage usage) {
     GGML_ASSERT(buffer);
     GGML_ASSERT(ggml_backend_buffer_is_multi_buffer(buffer));
@@ -1955,6 +1969,20 @@ size_t ggml_backend_sched_get_buffer_size(ggml_backend_sched_t sched, ggml_backe
     GGML_ASSERT(backend_index >= 0 && backend_index < sched->n_backends);
 
     return ggml_gallocr_get_buffer_size(sched->galloc, backend_index);
+}
+
+int ggml_backend_sched_get_buffer_count(ggml_backend_sched_t sched, ggml_backend_t backend) {
+    GGML_ASSERT(sched);
+    int backend_index = ggml_backend_sched_backend_id(sched, backend);
+    GGML_ASSERT(backend_index >= 0 && backend_index < sched->n_backends);
+    return ggml_gallocr_get_buffer_count(sched->galloc, backend_index);
+}
+
+ggml_backend_buffer_t ggml_backend_sched_get_buffer(ggml_backend_sched_t sched, ggml_backend_t backend, int chunk_id) {
+    GGML_ASSERT(sched);
+    int backend_index = ggml_backend_sched_backend_id(sched, backend);
+    GGML_ASSERT(backend_index >= 0 && backend_index < sched->n_backends);
+    return ggml_gallocr_get_buffer(sched->galloc, backend_index, chunk_id);
 }
 
 void ggml_backend_sched_set_tensor_backend(ggml_backend_sched_t sched, struct ggml_tensor * node, ggml_backend_t backend) {

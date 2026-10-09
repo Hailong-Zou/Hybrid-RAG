@@ -82,6 +82,13 @@ struct llama_device_memory_data {
 
 // TODO: convert to C-style data structure
 using llama_memory_breakdown = std::map<ggml_backend_buffer_type_t, llama_memory_breakdown_data>;
+enum llama_memory_region_kind {
+    LLAMA_MEMORY_REGION_MODEL = 0,
+    LLAMA_MEMORY_REGION_KV = 1,
+    LLAMA_MEMORY_REGION_RUNTIME = 2,
+    LLAMA_MEMORY_REGION_INTERMEDIATE = 3,
+};
+using llama_memory_region_callback = void (*)(void * userdata, const void * base, size_t size, llama_memory_region_kind kind, ggml_backend_buffer_type_t buft);
 
 LLAMA_API int32_t llama_model_n_expert (const struct llama_model * model);
 LLAMA_API int32_t llama_model_n_devices(const struct llama_model * model);
@@ -89,6 +96,8 @@ LLAMA_API int32_t llama_model_n_devices(const struct llama_model * model);
 LLAMA_API ggml_backend_dev_t llama_model_get_device(const struct llama_model * model, int i);
 
 LLAMA_API llama_memory_breakdown llama_get_memory_breakdown(const struct llama_context * ctx);
+LLAMA_API void llama_model_visit_memory_regions(const struct llama_model * model, llama_memory_region_callback callback, void * userdata);
+LLAMA_API void llama_context_visit_memory_regions(const struct llama_context * ctx, llama_memory_region_callback callback, void * userdata);
 
 // Set whether the context outputs nextn embeddings or not
 // If masked == true,  output the embeddings only for the tokens with batch.logits != 0

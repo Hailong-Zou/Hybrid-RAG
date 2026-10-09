@@ -6,13 +6,32 @@
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
+#include <cerrno>
+#include <cstdint>
+#include <cstdio>
 #include <numeric>
 #include <stdexcept>
+#include <fstream>
+#include <limits>
+#if defined(__linux__)
+#include <sys/mman.h>
+#include <unistd.h>
+#endif
 
 static int64_t rag_steady_time_ms() {
     return std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now().time_since_epoch())
             .count();
+}
+
+static std::uint64_t rag_memavailable_bytes() {
+    std::ifstream meminfo("/proc/meminfo");
+    std::string key, unit;
+    std::uint64_t value = 0;
+    while (meminfo >> key >> value >> unit) {
+        if (key == "MemAvailable:") return value * 1024;
+    }
+    return 0;
 }
 
 static void rag_atomic_min(std::atomic<std::int64_t> & target, std::int64_t value) {
@@ -39,9 +58,9 @@ static void rag_memory_marker(const char * event, const char * stage,
             "request=%" PRIu64 " task=%d stage=%s candidate=%lld "
             "weights_bytes=unavailable kv_bytes=unavailable "
             "runtime_bytes=unavailable intermediate_bytes=unavailable "
-            "known_total_bytes=unavailable\n",
+            "known_total_bytes=unavailable memavailable_bytes=%" PRIu64 "\n",
             static_cast<long long>(now_ns), event, request_id, task_id,
-            stage, candidate);
+            stage, candidate, rag_memavailable_bytes());
 }
 
 // Count dynamically reserved storage, not just container headers. An SSO
@@ -139,6 +158,219 @@ static void rag_intermediate_snapshot(RagRequestRuntime & r,
             candidate, query_bytes, embedding_bytes, retrieval_bytes,
             rerank_bytes, prompt_bytes, state_bytes, total);
 }
+struct rag_physical_range {
+    std::uintptr_t begin;
+    std::uintptr_t end;
+};
+
+static void rag_physical_add_range(std::vector<rag_physical_range> & ranges,
+                                   const void * base, std::size_t bytes) {
+    if (base == nullptr || bytes == 0) return;
+    const auto begin = reinterpret_cast<std::uintptr_t>(base);
+    if (bytes > std::numeric_limits<std::uintptr_t>::max() - begin) return;
+    ranges.push_back({begin, begin + bytes});
+}
+
+static void rag_physical_add_string(std::vector<rag_physical_range> & ranges,
+                                    const std::string & value) {
+    rag_physical_add_range(ranges, value.data(), value.capacity() + 1);
+}
+
+template <typename T>
+static void rag_physical_add_vector(std::vector<rag_physical_range> & ranges,
+                                    const std::vector<T> & value) {
+    if (value.capacity() <= std::numeric_limits<std::size_t>::max() / sizeof(T)) {
+        rag_physical_add_range(ranges, value.data(), value.capacity() * sizeof(T));
+    }
+}
+
+static void rag_physical_add_string_vector(std::vector<rag_physical_range> & ranges,
+                                           const std::vector<std::string> & value) {
+    rag_physical_add_vector(ranges, value);
+    for (const auto & item : value) rag_physical_add_string(ranges, item);
+}
+
+template <typename T>
+static void rag_physical_add_nested_vector(std::vector<rag_physical_range> & ranges,
+                                           const std::vector<std::vector<T>> & value) {
+    rag_physical_add_vector(ranges, value);
+    for (const auto & item : value) rag_physical_add_vector(ranges, item);
+}
+
+static void rag_physical_add_branch(std::vector<rag_physical_range> & ranges,
+                                    const RagQueryBranchResult & branch) {
+    rag_physical_add_string(ranges, branch.query);
+    rag_physical_add_vector(ranges, branch.embedding);
+    rag_physical_add_vector(ranges, branch.retrieval_indices);
+    rag_physical_add_string(ranges, branch.error);
+}
+
+static void rag_physical_add_candidate(std::vector<rag_physical_range> & ranges,
+                                       const RagGenerationCandidate & candidate) {
+    rag_physical_add_string(ranges, candidate.prompt);
+    rag_physical_add_string(ranges, candidate.content);
+    rag_physical_add_string(ranges, candidate.stop_reason);
+    rag_physical_add_string(ranges, candidate.error);
+    rag_physical_add_string(ranges, candidate.generation_handoff_producer_backend);
+}
+static void rag_physical_add_completed_retrieval(
+        std::vector<rag_physical_range> & ranges, const RagRequestRuntime & r) {
+    rag_physical_add_string_vector(ranges, r.chunks);
+    rag_physical_add_nested_vector(ranges, r.document_embeddings);
+    rag_physical_add_string_vector(ranges, r.expanded_queries);
+    rag_physical_add_vector(ranges, r.query_branches);
+    for (const auto & branch : r.query_branches) rag_physical_add_branch(ranges, branch);
+    rag_physical_add_nested_vector(ranges, r.retrieval_results);
+    rag_physical_add_vector(ranges, r.retrieved_indices);
+}
+
+static void rag_physical_intermediate_snapshot(RagRequestRuntime & r,
+        RagTaskType type, const char * stage, const char * event, int task_id,
+        std::size_t query_index, std::size_t candidate_index) {
+    if (!rag_mem_profile_enabled()) return;
+    std::vector<rag_physical_range> ranges;
+    rag_physical_add_string(ranges, r.request.doc);
+    rag_physical_add_string(ranges, r.request.query);
+
+    switch (type) {
+        case RagTaskType::DocumentEmbedding:
+            rag_physical_add_string_vector(ranges, r.chunks);
+            rag_physical_add_nested_vector(ranges, r.document_embeddings);
+            break;
+        case RagTaskType::QueryExpansion:
+            rag_physical_add_string_vector(ranges, r.expanded_queries);
+            break;
+        case RagTaskType::QueryEmbedding:
+        case RagTaskType::VectorSearch:
+            rag_physical_add_string_vector(ranges, r.chunks);
+            rag_physical_add_nested_vector(ranges, r.document_embeddings);
+            rag_physical_add_string_vector(ranges, r.expanded_queries);
+            if (query_index < r.query_branches.size()) {
+                rag_physical_add_branch(ranges, r.query_branches[query_index]);
+            }
+            break;
+        case RagTaskType::RetrievalMerge:
+            rag_physical_add_completed_retrieval(ranges, r);
+            break;
+        case RagTaskType::Reranking:
+            rag_physical_add_completed_retrieval(ranges, r);
+            rag_physical_add_string_vector(ranges, r.reranked_chunks);
+            break;
+        case RagTaskType::Generation:
+        case RagTaskType::GenerationPrefill:
+            rag_physical_add_completed_retrieval(ranges, r);
+            rag_physical_add_string_vector(ranges, r.reranked_chunks);
+            rag_physical_add_string(ranges, r.generation_prompt);
+            if (candidate_index < r.generation_candidates.size()) {
+                rag_physical_add_candidate(ranges, r.generation_candidates[candidate_index]);
+            }
+            break;
+        case RagTaskType::GenerationDecode:
+            rag_physical_add_completed_retrieval(ranges, r);
+            rag_physical_add_string_vector(ranges, r.reranked_chunks);
+            rag_physical_add_string(ranges, r.generation_prompt);
+            if (candidate_index < r.generation_candidates.size()) {
+                rag_physical_add_candidate(ranges, r.generation_candidates[candidate_index]);
+            }
+            break;
+        case RagTaskType::CandidateMerge:
+            rag_physical_add_completed_retrieval(ranges, r);
+            rag_physical_add_string_vector(ranges, r.reranked_chunks);
+            rag_physical_add_string(ranges, r.generation_prompt);
+            rag_physical_add_vector(ranges, r.generation_candidates);
+            for (const auto & candidate : r.generation_candidates) {
+                rag_physical_add_candidate(ranges, candidate);
+            }
+            break;
+        case RagTaskType::Finalize:
+            rag_physical_add_completed_retrieval(ranges, r);
+            rag_physical_add_string_vector(ranges, r.reranked_chunks);
+            rag_physical_add_string(ranges, r.generation_prompt);
+            rag_physical_add_vector(ranges, r.generation_candidates);
+            for (const auto & candidate : r.generation_candidates) {
+                rag_physical_add_candidate(ranges, candidate);
+            }
+            rag_physical_add_string(ranges, r.generation_result);
+            rag_physical_add_string(ranges, r.final_answer);
+            break;
+    }
+
+#if defined(__linux__)
+    const long page_size_long = sysconf(_SC_PAGESIZE);
+    std::size_t resident_bytes = 0;
+    std::size_t mincore_calls = 0;
+    std::size_t mincore_failures = 0;
+    int last_errno = 0;
+    if (page_size_long > 0) {
+        const auto page_size = static_cast<std::uintptr_t>(page_size_long);
+        std::vector<rag_physical_range> pages;
+        std::size_t range_bytes = 0;
+        for (const auto & range : ranges) {
+            range_bytes += range.end - range.begin;
+            if (range.end > std::numeric_limits<std::uintptr_t>::max() - (page_size - 1)) continue;
+            const auto begin = range.begin & ~(page_size - 1);
+            const auto end = (range.end + page_size - 1) & ~(page_size - 1);
+            if (end > begin) pages.push_back({begin, end});
+        }
+        std::sort(pages.begin(), pages.end(), [](const auto & a, const auto & b) {
+            return a.begin < b.begin;
+        });
+        std::vector<rag_physical_range> merged_pages;
+        for (const auto & page_range : pages) {
+            if (merged_pages.empty() || page_range.begin > merged_pages.back().end) {
+                merged_pages.push_back(page_range);
+            } else {
+                merged_pages.back().end = std::max(merged_pages.back().end, page_range.end);
+            }
+        }
+        pages.swap(merged_pages);
+        std::vector<unsigned char> vec;
+        for (const auto & range : pages) {
+            const std::size_t n_pages = (range.end - range.begin) / page_size;
+            if (n_pages == 0) continue;
+            vec.resize(n_pages);
+            ++mincore_calls;
+            if (mincore(reinterpret_cast<void *>(range.begin), range.end - range.begin,
+                        vec.data()) != 0) {
+                ++mincore_failures;
+                last_errno = errno;
+                continue;
+            }
+            for (const auto resident : vec) {
+                if ((resident & 1) != 0) resident_bytes += page_size;
+            }
+        }
+        const auto now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::system_clock::now().time_since_epoch()).count();
+        const auto memavailable = rag_memavailable_bytes();
+        const char * baseline_env = std::getenv("LLAMA_MEM_AVAILABLE_BASELINE_BYTES");
+        char increment_text[32] = "unavailable";
+        if (baseline_env != nullptr && baseline_env[0] != '\0' && memavailable != 0) {
+            const auto baseline = std::strtoull(baseline_env, nullptr, 10);
+            const auto increment = baseline > memavailable ? baseline - memavailable : 0;
+            std::snprintf(increment_text, sizeof(increment_text), "%" PRIu64,
+                          static_cast<std::uint64_t>(increment));
+        }
+        const long long candidate = candidate_index == RAG_INVALID_INDEX
+                ? -1 : static_cast<long long>(candidate_index);
+        SRV_INF("RAG_INTERMEDIATE_PHYS ts_epoch_ns=%lld request=%" PRIu64
+                " event=%s stage=%s task=%d query=%zu candidate=%lld "
+                "intermediate_range_bytes=%zu intermediate_resident_bytes=%zu "
+                "memavailable_bytes=%" PRIu64 " system_increment_bytes=%s "
+                "mincore_calls=%zu mincore_failures=%zu errno=%d "
+                "resident_scope=known_address_page_coverage_shared_page_overhead_possible\n",
+                static_cast<long long>(now_ns), r.request_id, event, stage, task_id,
+                query_index, candidate, range_bytes, resident_bytes, memavailable,
+                increment_text, mincore_calls, mincore_failures, last_errno);
+    }
+#else
+    SRV_INF("RAG_INTERMEDIATE_PHYS request=%" PRIu64
+            " event=%s stage=%s task=%d query=%zu candidate=%zu "
+            "intermediate_resident_bytes=unavailable resident_scope=unsupported\n",
+            r.request_id, event, stage, task_id, query_index, candidate_index);
+#endif
+}
+
 
 RagServerExecutor::RagServerExecutor(server_models * models, RagTaskType type)
     : models_(models), type_(type) {}
@@ -177,6 +409,8 @@ RagTaskResult RagServerExecutor::execute(const RagTaskContext & ctx) {
                       ctx.task_id, ctx.candidate_index);
     rag_intermediate_snapshot(*runtime, stage_name(type_), "BEGIN",
                               ctx.task_id, ctx.candidate_index);
+    rag_physical_intermediate_snapshot(*runtime, type_, stage_name(type_), "BEGIN",
+                                       ctx.task_id, ctx.query_index, ctx.candidate_index);
     SRV_INF(
             "RAG_STAGE_BEGIN request=%" PRIu64 " task=%d stage=%s "
             "query_index=%zu candidate_index=%zu\n",
@@ -217,6 +451,8 @@ RagTaskResult RagServerExecutor::execute(const RagTaskContext & ctx) {
                         std::move(embeddings.front()));
                 rag_intermediate_snapshot(*runtime, "document_embedding", "AFTER_CHUNK",
                                           ctx.task_id, ctx.candidate_index);
+                rag_physical_intermediate_snapshot(*runtime, type_, "document_embedding", "AFTER_CHUNK",
+                                                   ctx.task_id, ctx.query_index, ctx.candidate_index);
             }
 
             if (req.stage_model_residency) {
@@ -326,6 +562,8 @@ RagTaskResult RagServerExecutor::execute(const RagTaskContext & ctx) {
             if (runtime->expanded_queries.empty()) {
                 runtime->expanded_queries.push_back(req.query);
             }
+            rag_physical_intermediate_snapshot(*runtime, type_, "query_expansion", "EXPANSIONS_READY",
+                                               ctx.task_id, ctx.query_index, ctx.candidate_index);
 
             if (req.stage_model_residency &&
                 req.enable_query_expansion) {
@@ -374,6 +612,8 @@ RagTaskResult RagServerExecutor::execute(const RagTaskContext & ctx) {
             rag_profile_branch(*runtime, ctx.query_index);
             branch.error.clear();
             branch.success = false;
+            rag_physical_intermediate_snapshot(*runtime, type_, "query_embedding", "EMBEDDING_READY",
+                                               ctx.task_id, ctx.query_index, ctx.candidate_index);
         } else if (type_ == RagTaskType::VectorSearch) {
             if (ctx.query_index == RAG_INVALID_INDEX ||
                 ctx.query_index >=
@@ -457,6 +697,8 @@ RagTaskResult RagServerExecutor::execute(const RagTaskContext & ctx) {
         rag_intermediate_snapshot(*runtime, "reranking", "CANDIDATES_READY",
                                   ctx.task_id, ctx.candidate_index,
                                   rag_string_vector_bytes(candidates));
+        rag_physical_intermediate_snapshot(*runtime, type_, "reranking", "CANDIDATES_READY",
+                                           ctx.task_id, ctx.query_index, ctx.candidate_index);
 
         if (!req.rerank_model.empty()) {
             const json ranked =
@@ -561,6 +803,8 @@ RagTaskResult RagServerExecutor::execute(const RagTaskContext & ctx) {
             rag_profile_candidate(*runtime, ctx.candidate_index);
             rag_intermediate_snapshot(*runtime, "generation_prefill", "PROMPT_READY",
                                       ctx.task_id, ctx.candidate_index);
+            rag_physical_intermediate_snapshot(*runtime, type_, "generation_prefill", "PROMPT_READY",
+                                               ctx.task_id, ctx.query_index, ctx.candidate_index);
 
             candidate.content.clear();
             candidate.stop_reason.clear();
@@ -1213,6 +1457,8 @@ RagTaskResult RagServerExecutor::execute(const RagTaskContext & ctx) {
     }
     rag_intermediate_snapshot(*runtime, stage_name(type_), "END",
                               ctx.task_id, ctx.candidate_index);
+    rag_physical_intermediate_snapshot(*runtime, type_, stage_name(type_), "END",
+                                       ctx.task_id, ctx.query_index, ctx.candidate_index);
     rag_memory_marker("STAGE_END", stage_name(type_), runtime->request_id,
                       ctx.task_id, ctx.candidate_index);
     if (type_ == RagTaskType::Finalize) {

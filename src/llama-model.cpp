@@ -1843,7 +1843,38 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                     std::move(ctx_ptr),
                     std::vector<ggml_backend_buffer_ptr>{});
 
-            ctx_buf_maps.emplace_back(ctx, buf_map);
+            const char * skip_source_env =
+                    std::getenv("LLAMA_REPACK_SKIP_SOURCE_PAYLOAD");
+            const char * prepack_load_dir =
+                    std::getenv("LLAMA_REPACK_PREPACK_LOAD_DIR");
+            const char * buft_name = ggml_backend_buft_name(buft);
+            const bool htp_repack_source_skip =
+                    ml.use_direct_io &&
+                    skip_source_env != nullptr &&
+                    strcmp(skip_source_env, "1") == 0 &&
+                    prepack_load_dir != nullptr &&
+                    prepack_load_dir[0] != '\0' &&
+                    buft_name != nullptr &&
+                    strstr(buft_name, "HTP") != nullptr &&
+                    strstr(buft_name, "REPACK") != nullptr;
+            if (htp_repack_source_skip) {
+                size_t skipped_source_bytes = 0;
+                size_t skipped_source_tensors = 0;
+                for (ggml_tensor * t = ggml_get_first_tensor(ctx);
+                        t != nullptr;
+                        t = ggml_get_next_tensor(ctx, t)) {
+                    skipped_source_bytes += ggml_nbytes(t);
+                    ++skipped_source_tensors;
+                }
+                LLAMA_LOG_WARN(
+                        "REPACK_SOURCE_PAYLOAD_SKIPPED: chunk=%d tensors=%zu source_bytes=%zu mode=metadata_only prepack_dir=%s\n",
+                        ctx_key.repack_chunk,
+                        skipped_source_tensors,
+                        skipped_source_bytes,
+                        prepack_load_dir);
+            } else {
+                ctx_buf_maps.emplace_back(ctx, buf_map);
+            }
             continue;
         }
 
@@ -2242,6 +2273,46 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_model::memory_breakdown() con
 
     return ret;
 }
+namespace {
+struct llama_backend_memory_visit {
+    llama_memory_region_callback callback;
+    void * userdata;
+    llama_memory_region_kind kind;
+};
+
+void llama_backend_memory_visit_cb(void * userdata, void * base, size_t size, ggml_backend_buffer_type_t buft) {
+    auto * visit = static_cast<llama_backend_memory_visit *>(userdata);
+    visit->callback(visit->userdata, base, size, visit->kind, buft);
+}
+}
+
+void llama_model::visit_memory_regions(llama_memory_region_callback callback, void * userdata) const {
+    if (callback == nullptr) {
+        return;
+    }
+
+    llama_backend_memory_visit visit{callback, userdata, LLAMA_MEMORY_REGION_MODEL};
+    for (const auto & [ctx, bufs] : pimpl->ctxs_bufs) {
+        (void) ctx;
+        for (const auto & buf : bufs) {
+            ggml_backend_buffer_visit(buf.get(), llama_backend_memory_visit_cb, &visit);
+        }
+    }
+    for (const auto & group : pimpl->repack_slot_groups) {
+        for (const auto & slot : group.slots) {
+            if (slot) {
+                ggml_backend_buffer_visit(slot.get(), llama_backend_memory_visit_cb, &visit);
+            }
+        }
+    }
+}
+
+void llama_model_visit_memory_regions(const struct llama_model * model, llama_memory_region_callback callback, void * userdata) {
+    if (model != nullptr) {
+        model->visit_memory_regions(callback, userdata);
+    }
+}
+
 
 uint64_t llama_model::n_elements() const {
     return pimpl->n_elements;

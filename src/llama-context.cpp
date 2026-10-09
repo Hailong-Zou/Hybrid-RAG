@@ -5087,6 +5087,51 @@ void llama_opt_epoch(
 llama_memory_breakdown llama_get_memory_breakdown(const struct llama_context * ctx) {
     return ctx->memory_breakdown();
 }
+namespace {
+struct llama_context_backend_memory_visit {
+    llama_memory_region_callback callback;
+    void * userdata;
+    llama_memory_region_kind kind;
+};
+
+void llama_context_backend_memory_visit_cb(void * userdata, void * base, size_t size, ggml_backend_buffer_type_t buft) {
+    auto * visit = static_cast<llama_context_backend_memory_visit *>(userdata);
+    visit->callback(visit->userdata, base, size, visit->kind, buft);
+}
+}
+
+void llama_context_visit_memory_regions(const struct llama_context * ctx, llama_memory_region_callback callback, void * userdata) {
+    if (ctx == nullptr || callback == nullptr) {
+        return;
+    }
+
+    llama_context_backend_memory_visit visit{callback, userdata, LLAMA_MEMORY_REGION_KV};
+    if (ctx->memory) {
+        const auto * kv_cache = dynamic_cast<const llama_kv_cache *>(ctx->memory.get());
+        if (kv_cache != nullptr) {
+            for (const auto & [kv_ctx, buf] : kv_cache->ctxs_bufs) {
+                (void) kv_ctx;
+                ggml_backend_buffer_visit(buf.get(), llama_context_backend_memory_visit_cb, &visit);
+            }
+        }
+    }
+
+    visit.kind = LLAMA_MEMORY_REGION_RUNTIME;
+    if (ctx->buf_output) {
+        ggml_backend_buffer_visit(ctx->buf_output.get(), llama_context_backend_memory_visit_cb, &visit);
+    }
+    if (ctx->sched) {
+        const int n_backends = ggml_backend_sched_get_n_backends(ctx->sched.get());
+        for (int i = 0; i < n_backends; ++i) {
+            ggml_backend_t backend = ggml_backend_sched_get_backend(ctx->sched.get(), i);
+            const int n_buffers = ggml_backend_sched_get_buffer_count(ctx->sched.get(), backend);
+            for (int j = 0; j < n_buffers; ++j) {
+                ggml_backend_buffer_t buffer = ggml_backend_sched_get_buffer(ctx->sched.get(), backend, j);
+                ggml_backend_buffer_visit(buffer, llama_context_backend_memory_visit_cb, &visit);
+            }
+        }
+    }
+}
 
 llama_context * llama_get_ctx_other(struct llama_context * ctx) {
     return ctx->get_cparams().ctx_other;

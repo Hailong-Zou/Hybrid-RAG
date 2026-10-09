@@ -180,15 +180,18 @@ struct llama_file::impl {
         }
     }
 #else
-    impl(const char * fname, const char * mode, [[maybe_unused]] const bool use_direct_io = false) : fname(fname) {
+    impl(const char * fname, const char * mode, const bool use_direct_io = false) : fname(fname), direct_io_requested(use_direct_io) {
 #ifdef __linux__
         // Try unbuffered I/O for read only
         if (use_direct_io && std::strcmp(mode, "rb") == 0) {
             if (init_fd()) {
                 return;
             }
-            LLAMA_LOG_WARN("Failed to open file '%s' with error: %s. Falling back to buffered I/O",
-                           fname, strerror(errno));
+            const int open_errno = errno;
+            ++buffered_fallback_count;
+            last_fallback_errno = open_errno;
+            LLAMA_LOG_WARN("Failed to open file '%s' with O_DIRECT error=%d (%s). Falling back to buffered I/O\n",
+                           fname, open_errno, strerror(open_errno));
         }
 #endif
         init_fp(mode);
@@ -199,11 +202,18 @@ struct llama_file::impl {
         fd = open(fname.c_str(), O_RDONLY | O_DIRECT);
 
         if (fd != -1) {
+            const int status_flags = fcntl(fd, F_GETFL);
+            direct_io_activated = status_flags != -1 && (status_flags & O_DIRECT) == O_DIRECT;
+            LLAMA_LOG_WARN("DIRECT_IO_OPEN path=%s fd=%d f_getfl=%#o o_direct=%#o active=%d\n",
+                    fname.c_str(), fd,
+                    status_flags < 0 ? 0 : status_flags, O_DIRECT,
+                    direct_io_activated ? 1 : 0);
             struct stat file_stats{};
             fstat(fd, &file_stats);
 
             size = file_stats.st_size;
             alignment = file_stats.st_blksize;
+            LLAMA_LOG_WARN("DIRECT_IO_ALIGNMENT path=%s block_alignment=%zu file_bytes=%zu\n", fname.c_str(), alignment, size);
 
             off_t ret = lseek(fd, 0, SEEK_SET);
             if (ret == -1) {
@@ -277,6 +287,9 @@ struct llama_file::impl {
             if (to_read > 0 && ret != 1) {
                 throw std::runtime_error("unexpectedly reached end of file");
             }
+            if (direct_io_requested) {
+                buffered_fallback_read_bytes += to_read;
+            }
         } else {
             size_t bytes_read = 0;
             while (bytes_read < len) {
@@ -290,6 +303,8 @@ struct llama_file::impl {
                     // Fallback to std::fread in case the DMA controller cannot access the buffer
                     if (errno == EFAULT || errno == EINVAL) {
                         LLAMA_LOG_WARN("%s: Falling back to buffered IO due to %s\n", __func__, strerror(errno));
+                        ++buffered_fallback_count;
+                        last_fallback_errno = errno;
                         auto curr_off = tell();
                         close(fd);
                         fd = -1;
@@ -311,6 +326,7 @@ struct llama_file::impl {
                     throw std::runtime_error("unexpectedly reached end of file");
                 }
 
+                direct_io_read_bytes += (size_t) ret;
                 bytes_read += (size_t) ret;
             }
         }
@@ -374,6 +390,12 @@ struct llama_file::impl {
     }
 
     ~impl() {
+        if (direct_io_requested) {
+            LLAMA_LOG_WARN("DIRECT_IO_FILE_SUMMARY path=%s requested=1 activated=%d direct_read_bytes=%zu buffered_fallback_bytes=%zu fallback_count=%zu last_fallback_errno=%d\n",
+                    fname.c_str(), direct_io_activated ? 1 : 0,
+                    direct_io_read_bytes, buffered_fallback_read_bytes,
+                    buffered_fallback_count, last_fallback_errno);
+        }
         if (fd != -1) {
             close(fd);
         } else if (owns_fp) {
@@ -382,6 +404,12 @@ struct llama_file::impl {
     }
     int fd = -1;
     std::string fname;
+    bool direct_io_requested = false;
+    bool direct_io_activated = false;
+    std::size_t direct_io_read_bytes = 0;
+    std::size_t buffered_fallback_read_bytes = 0;
+    std::size_t buffered_fallback_count = 0;
+    int last_fallback_errno = 0;
 #endif
 
     size_t read_alignment() const {

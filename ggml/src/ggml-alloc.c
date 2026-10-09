@@ -1116,6 +1116,35 @@ size_t ggml_gallocr_get_buffer_size(ggml_gallocr_t galloc, int buffer_id) {
 
 // utils
 
+int ggml_gallocr_get_buffer_count(ggml_gallocr_t galloc, int buffer_id) {
+    GGML_ASSERT(buffer_id >= 0 && buffer_id < galloc->n_buffers);
+
+    struct vbuffer * buffer = galloc->buffers[buffer_id];
+    if (buffer == NULL) {
+        return 0;
+    }
+
+    for (int i = 0; i < buffer_id; ++i) {
+        if (galloc->buffers[i] == buffer) {
+            return 0;
+        }
+    }
+
+    int count = 0;
+    while (count < GGML_VBUFFER_MAX_CHUNKS && buffer->chunks[count] != NULL) {
+        ++count;
+    }
+    return count;
+}
+
+ggml_backend_buffer_t ggml_gallocr_get_buffer(ggml_gallocr_t galloc, int buffer_id, int chunk_id) {
+    const int count = ggml_gallocr_get_buffer_count(galloc, buffer_id);
+    if (chunk_id < 0 || chunk_id >= count) {
+        return NULL;
+    }
+    return galloc->buffers[buffer_id]->chunks[chunk_id];
+}
+
 static void free_buffers(ggml_backend_buffer_t ** buffers, const size_t * n_buffers) {
     for (size_t i = 0; i < *n_buffers; i++) {
         ggml_backend_buffer_free((*buffers)[i]);
